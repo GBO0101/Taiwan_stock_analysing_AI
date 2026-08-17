@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>台股查詢理解工具</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="container">
+    <header>
+      <h1>台股查詢理解工具</h1>
+      <p class="subtitle">Boundary → Classification → (conditional) Decomposition</p>
+    </header>
+
+    <section class="query-box">
+      <input
+        id="question-input"
+        type="text"
+        placeholder="輸入問題，例如：台積電未來展望如何"
+        autocomplete="off"
+      />
+      <button id="submit-btn" type="button">送出</button>
+    </section>
+
+    <section class="controls">
+      <label class="toggle">
+        <input id="show-json" type="checkbox" />
+        <span>Show pipeline output</span>
+      </label>
+    </section>
+
+    <section id="error-banner" class="error-banner hidden"></section>
+
+    <section id="results" class="results hidden">
+      <h2>Pipeline 結果</h2>
+      <div id="steps"></div>
+      <div id="chart-container" class="chart-container hidden">
+        <h3>圖表</h3>
+        <img id="chart-img" alt="chart" />
+        <p id="chart-message" class="chart-message hidden"></p>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js" defer></script>
+</body>
+</html>
