@@ -1,0 +1,59 @@
+You are generating a planned sentiment_analysis node for the decomposition DAG.
+
+This does NOT execute sentiment analysis. It only defines the information needed for a future sentiment analysis operation.
+
+## When to Include sentiment_analysis Node
+
+Include a sentiment_analysis node when the analytical question involves:
+- Future outlook / forward-looking assessment
+- Market sentiment / investor sentiment
+- News impact analysis
+- Qualitative assessment requiring news interpretation
+
+## Node Structure
+
+The sentiment_analysis node should have:
+- **id**: Unique identifier (e.g., "q4")
+- **operation**: "sentiment_analysis"
+- **datasets**: ["TaiwanStockNews"] (source of news data)
+- **params**: {
+    "stock_id": "2330",
+    "start_date": "2024-01-01",
+    "end_date": "2024-12-31",
+    "analysis_type": "general|earnings|guidance|risk"
+  }
+- **depends_on**: ["q1"] (depends on the news query node)
+
+## Step 1 Boundary Context
+{% if boundary %}
+Boundary extraction result:
+{{ boundary | tojson }}
+{% endif %}
+
+## Step 2 Classification Context
+{% if classification %}
+Classification result:
+{{ classification | tojson }}
+{% endif %}
+
+## Current Question
+{{ question }}
+
+## Output
+Return the sentiment_analysis node as a JSON object, or null if not needed.
+
+Example output:
+{
+  "id": "q4",
+  "operation": "sentiment_analysis",
+  "datasets": ["TaiwanStockNews"],
+  "computed_field": null,
+  "formula": null,
+  "params": {
+    "stock_id": "2330",
+    "start_date": "2024-01-01",
+    "end_date": "2024-12-31",
+    "analysis_type": "general"
+  },
+  "depends_on": ["q1"]
+}

@@ -1,0 +1,31 @@
+# Environment / secrets (contains real FinMind token — NEVER commit)
+.env
+
+# Python caches
+__pycache__/
+*.pyc
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Generated chart output
+output/
+
+# Tooling / local state
+.omo/
+.codegraph/
+
+# Standalone scraped datasets (not part of the pipeline)
+finmind_data/
+
+# Generated status file
+finmind_dataset_status.json
+
+# Binary documents
+*.pdf
+*.docx
+*.doc
+
+# OS / editor
+.DS_Store
+Thumbs.db

@@ -1,0 +1,7 @@
+indicator,dataset,field,derived_calculation
+revenue_growth,TaiwanStockMonthRevenue,revenue,"(current_revenue - prior_revenue) / prior_revenue * 100"
+eps,TaiwanStockFinancialStatements,eps,"basic_eps from income statement"
+pe,TaiwanStockPER,pe_ratio,"price / eps"
+peg,TaiwanStockPER,pe_ratio,"pe / revenue_growth (requires revenue_growth calculation)"
+margin,TaiwanStockFinancialStatements,gross_profit,revenue,"gross_profit / revenue * 100"
+fcf,TaiwanStockCashFlowsStatement,free_cash_flow,"operating_cash_flow - capital_expenditure"

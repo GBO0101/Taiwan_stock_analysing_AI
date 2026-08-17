@@ -1,0 +1,209 @@
+LLM介紹:
+使用專案: chatanywhere/GPT_API_free
+專案網址: https://github.com/chatanywhere/GPT_API_free
+每日可使用模型與使用量:
+gpt-4o, gpt-4.1, gpt-5, gpt5.1, gpt-5.2, gpt-5.4, gpt-5.5, gpt-5.6-sol, gpt-5.6-luna, gpt-5.6-terra 5次
+gpt-3.5-turbo, gpt-4o-mini, gpt-4.1-mini, gpt-4.1-nano, gpt-5-mini, gpt-5-nano, gpt-5.4-mini, gpt-5.4-nano 100次
+deepseek-chat, deepseek-r1, deepseek-r1-0528, deepseek-r1-250528, deepseek-v3.2, deepseek-v3.2-thinking, deepseek-v4-flash, deepseek-v4-pro 30次
+(每日0點更新，使用量1萬)
+
+type有四種: live, topical, factual, non_financial
+
+live:
+即時/當前行情 — 價格報價、即時 tick、盤中快照
+FinMind 資料源: taiwan_stock_tick_snapshot
+needs_live_search: true
+needs_decomposition: false
+
+topical:
+需跨多資料集多跳推理的廣泛主題 — "哪些半導體股漲幅超過..."、"半導體板塊分析"
+FinMind 資料源: 多資料集
+needs_live_search: depends
+needs_decomposition: true
+
+factual:
+特定歷史數據查詢 — 日期區間、特定指標、財報
+FinMind 資料源: TaiwanStockPrice, TaiwanStockFinancialStatements, TaiwanStockMonthRevenue
+needs_live_search: false
+needs_decomposition: false
+
+non_financial:
+無關問題
+FinMind 資料源: 無
+needs_live_search: false
+needs_decomposition: false
+
+STEP 0 輸入問題
+PROMPT:
+"""
+從以下問題提取作用域邊界，輸出 JSON：
+Question: {question}
+
+{
+  "stock_scope": "single_stock|sector|market|multi_stock",
+  "stock_entities": ["2330","台積電"],
+  "time_scope": "real_time|relative|absolute|indefinite",
+  "time_spec": "最近30天|2024-07-01~2024-08-01|just_now|none",
+  "data_dimension": ["price","fundamentals","news"],
+  "market": "twse|otc|both",
+  "boundary_confidence": 0.92
+}
+"""
+STEP 1 分類
+範例PROMPT:
+"""
+你是台股問句分類器。將使用者問題分類為 live / topical / factual / none_financial，並提取實體。
+
+類型定義：
+- **live**：即時行情 → taiwan_stock_tick_snapshot
+- **topical**：廣泋主題/多跳推理 → needs_decomposition=true
+- **factual**：具體歷史數據 → 指定資料集查詢
+- **non_financial**：與台股無關（無股票代碼、無產業關鍵字、無市場語意）→ 提示用戶
+
+FinMind 可用資料集：TaiwanStockInfo(stock_id,stock_name,industry_category,type), TaiwanStockPrice(OHLCV), taiwan_stock_tick_snapshot(realtime), TaiwanStockPER(PER,PBR,dividend_yield), TaiwanStockFinancialStatements(income stmt), TaiwanStockBalanceSheet(balance), TaiwanStockCashFlowsStatement(cashflow), TaiwanStockMonthRevenue(revenue), TaiwanStockNews(title,content), TaiwanStockInstitutionalInvestorsBuySell(3 major investors), TaiwanStockMarginPurchaseShortSale(margin), TaiwanStockIndustryChain(concept map), TaiwanStockIndustryChainMoneyFlow(sector flow)
+
+問題: {question}
+
+輸出 ONLY JSON (no markdown, no extra text):
+{{
+  "type": "live|topical|factual|non_financial",
+  "reason": "一句話說明原因",
+  "needs_decomposition": true/false,
+  "needs_live_search": true/false,
+  "entities": {{"stock_codes": [], "company_names": [], "date_ranges": [], "metrics": [], "sectors": []}},
+  "scope": "single_stock|sector|market|multi_stock|none",
+  "target_datasets": [],
+  "confidence": 0.0-1.0,
+  "needs_clarification": true/false,                                                                              //追問細節
+  "clarification_question": "..." if needs_clarification,
+  "language": "zh-TW|en"
+}}
+"""
+
+
+範例格式:
+{
+  "type": "live",
+  "reason": "只有股票名稱，判斷為查詢股價相關資訊",
+  "needs_decomposition": false,
+  "needs_live_search": true,
+  "entities": {"stock_codes": ["2330"], "company_names": ["台積電"], "date_ranges": [], "metrics": []},
+  "scope": "single_stock",
+  "target_datasets": ["taiwan_stock_tick_snapshot"],
+  "confidence": 0.92,
+  "language": "zh-TW"
+}
+
+P.S. 老師8/7所詢問的只輸入"台積電"會發生什麼事? A：會如以上範例顯示輸出成JSON
+
+STEP 2 條件: type = topical
+LLM prompt:
+"""
+你是金融問句分解器。僅處理 topical 類型問題。
+
+輸入:
+- 原始問題: {question}
+- 分類結果: {classification_result}  ← 來自 Step 1
+- 實體: {entities}
+- 目標資料集: {target_datasets}
+
+規則:
+1. 若 classification.type == "non_financial" → 直接返回: {"error": "non_financial", "message": "請問您是想詢問台股相關資訊嗎？"}
+2. 若 type == "live" 或 "factual" → 無需分解，此 Prompt 不觸發
+3. 僅對 type == "topical" 執行分解 → (同前分解規則)
+4. 每個子查詢對應一個 FinMind 資料集 + 精確 params
+5. depends_on: 每個子查詢依賴的前一步驟
+6. 股票驗證步驟不可跳過
+
+
+輸出 ONLY JSON:
+{{
+  "sub_queries": [
+    {{
+      "step": 1,
+      "description": "功能描述",
+      "dataset": "TaiwanStockInfo",
+      "data_id": "2330",
+      "params": {{"data_id": "2330"}},
+      "depends_on": [],
+      "purpose": "驗證股票存在與所屬產業"
+    }},
+    ...
+  ]
+}}
+"""
+
+| 常見 topical 問題 | 涉及資料集 |
+|"哪些半導體股近期跑得漂亮？" | TaiwanStockInfo → TaiwanStockPrice → TaiwanStockPER |
+| "機構投資者最近在買什麼？" | TaiwanStockInstitutionalInvestorsBuySell → TaiwanStockPrice |
+| "融資比重高的股票最近走勢？" | TaiwanStockMarginPurchaseShortSale → TaiwanStockPrice |
+| "電動車概念股漲幅排行？" | TaiwanStockInfo + TaiwanStockIndustryChain → TaiwanStockPrice |
+| "大盤成分股與指數相關性？" | TaiwanStockPrice + TaiwanStockTotalReturnIndex |
+| "最近有哪些消息影響股價？" | TaiwanStockNews → TaiwanStockPriceTick |
+
+| 老師8/7提出的問題集 | 分類理由 | 涉及資料集 |
+| "記憶體未來如何?模組廠好嗎?" | 產業鏈前景推斷 — 需結合產業鏈位置 + 財務健康 + 最近走勢 + 盤中訊息 | TaiwanStockIndustryChain → TaiwanStockFinancialStatements → TaiwanStockPrice → TaiwanStockNews |
+| "半導體未來好嗎?趨勢如何?" | 板塊趨勢推斷 — 需比較板塊成員表現 + 估值 + 機構流向 | TaiwanStockInfo → TaiwanStockPrice → TaiwanStockPER → TaiwanStockInstitutionalInvestorsBuySell |
+| "台積電未來展望" | 個股前景推斷 — 結合財務健康 + 產業鏈地位 + 最近走勢 + 新聞情緒 | TaiwanStockFinancialStatements → TaiwanStockIndustryChain → TaiwanStockPrice → TaiwanStockNews |
+
+子查詢範例:
+
+問題1(單股未來展望): "台積電未來展望"
+{
+  "sub_queries": [
+    {"step": 1, "description": "驗證台積電存在與產業定位", "dataset": "TaiwanStockInfo", "data_id": "2330", "params": {"data_id": "2330"}, "depends_on": [], "purpose": "stock validation"},
+    {"step": 2, "description": "取得近30日股價走勢", "dataset": "TaiwanStockPrice", "data_id": "2330", "params": {"data_id": "2330", "start_date": "2026-07-11", "end_date": "2026-08-10"}, "depends_on": [1], "purpose": "price trend"},
+    {"step": 3, "description": "取得近7日財經新聞", "dataset": "TaiwanStockNews", "data_id": "2330", "params": {"stock_id": "2330", "start_date": "2026-08-03"}, "depends_on": [1], "purpose": "news sentiment"},
+    {"step": 4, "description": "情緒判斷 — 逐則新聞評分", "dataset": "sentiment_analysis", "params": {"model": "gpt-4o-mini", "language": "zh-TW"}, "depends_on": [3], "purpose": "sentiment scoring"},
+    {"step": 5, "description": "取得最近財報獲利指標", "dataset": "TaiwanStockFinancialStatements", "data_id": "2330", "params": {"data_id": "2330", "start_date": "2026-04-01"}, "depends_on": [1], "purpose": "fundamentals"},
+    {"step": 6, "description": "取得機構買賣動向", "dataset": "TaiwanStockInstitutionalInvestorsBuySell", "data_id": "2330", "params": {"data_id": "2330", "start_date": "2026-08-03"}, "depends_on": [1], "purpose": "institutional flow"}
+  ]
+}
+
+問題2(多股比較): "半導體板塊最近怎麼樣?"
+{
+  "sub_queries": [
+    {"step": 1, "description": "找出半導體產業所有股票", "dataset": "TaiwanStockInfo", "params": {"filter": "industry_category=半導體"}, "depends_on": [], "purpose": "sector stock list"},
+    {"step": 2, "description": "取得該板塊近30日股價", "dataset": "TaiwanStockPrice", "params": {"stock_id_list": ["2303","2330","2454","2317","3008","1590"], "start_date": "2026-07-11"}, "depends_on": [1], "purpose": "sector price trend"},
+    {"step": 3, "description": "取得板塊主流概念鏈", "dataset": "TaiwanStockIndustryChain", "params": {"filter": "industry=半導體"}, "depends_on": [1], "purpose": "concept chain"},
+    {"step": 4, "description": "取得板塊近期財經新聞", "dataset": "TaiwanStockNews", "params": {"query": "半導體", "start_date": "2026-08-03"}, "depends_on": [1], "purpose": "sector news"},
+    {"step": 5, "description": "情緒判斷 — 板塊新聞情緒分析", "dataset": "sentiment_analysis", "depends_on": [4], "purpose": "sentiment aggregation"},
+    {"step": 6, "description": "取得板塊整體資金流向", "dataset": "TaiwanStockInstitutionalInvestorsBuySell", "params": {"sector": "半導體", "start_date": "2026-08-03"}, "depends_on": [1], "purpose": "sector capital flow"}
+  ]
+}
+
+問題3(產業/主題分析): "0050跟00696哪個好?"
+{
+  "sub_queries": [
+    {"step": 1, "description": "驗證雙股存在與基本資訊", "dataset": "TaiwanStockInfo", "params": {"stock_id_list": ["0050","00696"]}, "depends_on": [], "purpose": "stock validation"},
+    {"step": 2, "description": "取得兩股近30日股價", "dataset": "TaiwanStockPrice", "params": {"stock_id_list": ["0050","00696"], "start_date": "2026-07-11"}, "depends_on": [1], "purpose": "price comparison"},
+    {"step": 3, "description": "取得兩股 PER/PBR/Dividend", "dataset": "TaiwanStockPER", "params": {"stock_id_list": ["0050","00696"]}, "depends_on": [1], "purpose": "valuation comparison"},
+    {"step": 4, "description": "取得兩股近期新聞情緒", "dataset": "TaiwanStockNews", "params": {"stock_id_list": ["0050","00696"], "start_date": "2026-08-03"}, "depends_on": [1], "purpose": "news sentiment"},
+    {"step": 5, "description": "情緒判斷 — 比較兩股消息面", "dataset": "sentiment_analysis", "depends_on": [4], "purpose": "sentiment comparison"},
+    {"step": 6, "description": "取得兩股近期機構買賣", "dataset": "TaiwanStockInstitutionalInvestorsBuySell", "params": {"stock_id_list": ["0050","00696"], "start_date": "2026-08-03"}, "depends_on": [1], "purpose": "institutional flow comparison"}
+  ]
+}
+
+問題4(市場面寬度分析): "大盤最近態勢如何?"
+{
+  "sub_queries": [
+    {"step": 1, "description": "取得加權指數走勢", "dataset": "TaiwanStockTotalReturnIndex", "data_id": "TAIEX", "params": {"data_id": "TAIEX", "start_date": "2026-07-11"}, "depends_on": [], "purpose": "index trend"},
+    {"step": 2, "description": "取得各產業資金流向", "dataset": "TailandStockIndustryChainMoneyFlow", "data_id": "TaiwanStockIndustryChainMoneyFlow", "params": {"start_date": "2026-08-09"}, "depends_on": [], "purpose": "sector capital flow"},
+    {"step": 3, "description": "取得市場近期新聞", "dataset": "TaiwanStockNews", "params": {"query": "台股 加權 大盤", "start_date": "2026-08-03"}, "depends_on": [], "purpose": "market sentiment"},
+    {"step": 4, "description": "情緒判斷 — 市場情緒分析", "dataset": "sentiment_analysis", "depends_on": [3], "purpose": "market sentiment score"},
+    {"step": 5, "description": "取得三大法人市場買賣", "dataset": "TaiwanStockTotalInstitutionalInvestors", "params": {"start_date": "2026-08-09"}, "depends_on": [], "purpose": "institutional net flow"}
+  ]
+}
+
+問題5(時序趨勢分析): "記憶體近期趨勢如何?"
+{
+  "sub_queries": [
+    {"step": 1, "description": "找出記憶體概念股名單", "dataset": "TaiwanStockIndustryChain", "params": {"concept": "記憶體"}, "depends_on": [], "purpose": "identify memory stocks"},
+    {"step": 2, "description": "驗證股票清單與產業標籤", "dataset": "TaiwanStockInfo", "params": {"stock_id_list": ["2330","2337","2408","2359"]}, "depends_on": [1], "purpose": "stock validation"},
+    {"step": 3, "description": "取得記憶體股近60日股價", "dataset": "TaiwanStockPrice", "params": {"stock_id_list": ["2330","2337","2408","2359"], "start_date": "2026-06-11"}, "depends_on": [2], "purpose": "price trend"},
+    {"step": 4, "description": "取得記憶體相關新聞", "dataset": "TaiwanStockNews", "params": {"query": "記憶體", "start_date": "2026-07-11"}, "depends_on": [], "purpose": "news sentiment"},
+    {"step": 5, "description": "情緒判斷 — 記憶體消息情緒", "dataset": "sentiment_analysis", "depends_on": [4], "purpose": "sentiment score"},
+    {"step": 6, "description": "取得記憶體股月營收趨勢", "dataset": "TaiwanStockMonthRevenue", "params": {"stock_id_list": ["2330","2337","2408","2359"], "start_date": "2026-02-01"}, "depends_on": [2], "purpose": "revenue trend"}
+  ]
+}
+
