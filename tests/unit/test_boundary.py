@@ -135,6 +135,27 @@ class TestBoundaryExtraction:
 
         assert result.stock_codes == ["2330"]
 
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_code_query_shows_chinese_name(self, mock_llm_client_class):
+        """Query by code: company_names must carry the Chinese name, not the code.
+
+        Reproduces the report where ``company_names`` stayed ``["3008"]`` instead
+        of ``["大立光"]`` when the user asked by stock code.
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        expected_result = BoundaryResult(
+            stock_codes=["3008"],  # LLM echoed the code as both code and name
+            company_names=["3008"],
+            confidence=0.9,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("3008股價走勢圖")
+
+        assert result.stock_codes == ["3008"]
+        assert result.company_names == ["大立光"]
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -47,6 +47,26 @@ class TestStockResolver:
         codes, warnings = stock_resolver.resolve(["台積電", "鴻海"], [])
         assert codes == ["2330", "2317"]
 
+    def test_resolve_drops_conflicting_llm_code(self):
+        # LLM gives a valid-but-wrong code (e.g. guesses 亞泥/1102 for a 台積電
+        # query). Resolver's name wins; only the correct code is emitted. This is
+        # the exact reproduction of the "boundary shows two stocks + chart uses
+        # the wrong one" bug.
+        codes, warnings = stock_resolver.resolve(["台積電"], ["1102"])
+        assert codes == ["2330"]
+        assert any("1102" in w for w in warnings)
+
+    def test_resolve_keeps_matching_llm_code_deduped(self):
+        # LLM gives the correct code alongside the name -> deduplicated to one.
+        codes, _ = stock_resolver.resolve(["台積電"], ["2330"])
+        assert codes == ["2330"]
+
+    def test_resolve_pure_code_query_kept(self):
+        # No company names -> a verified LLM code is kept as a fallback.
+        codes, warnings = stock_resolver.resolve([], ["2330"])
+        assert codes == ["2330"]
+        assert warnings == []
+
     def test_tie_break_prefers_twse(self, tmp_path):
         # Same name on both boards -> TWSE preferred (gap #4).
         data = [

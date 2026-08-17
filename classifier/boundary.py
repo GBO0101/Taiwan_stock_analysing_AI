@@ -51,7 +51,21 @@ def extract_boundary(
         resolved_codes, warnings = resolver.resolve(result.company_names, result.stock_codes)
         for warning in warnings:
             logger.warning("Boundary resolution: %s", warning)
+        # Derive company_names from the resolved codes via reverse lookup, so the
+        # field always carries the canonical Chinese name even when the user
+        # queried by code (e.g. "3008" -> "大立光"). Names the resolver could not
+        # map are intentionally dropped (they are also absent from stock_codes).
+        company_names: list[str] = []
+        seen_names: set[str] = set()
+        for code in resolved_codes:
+            info = resolver.verify_code(code)
+            if info["exists"] and info["name"]:
+                name = info["name"]
+                if name not in seen_names:
+                    company_names.append(name)
+                    seen_names.add(name)
         result.stock_codes = resolved_codes
+        result.company_names = company_names
         return result
     except LLMError as e:
         raise BoundaryExtractionError(f"Boundary extraction failed: {e}") from e

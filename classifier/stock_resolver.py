@@ -122,30 +122,24 @@ class StockResolver:
     ) -> tuple[list[str], list[str]]:
         """Resolve company names and reconcile with LLM-provided codes.
 
-        Returns ``(final_codes, warnings)``. ``final_codes`` is order-preserving
-        and de-duplicated. Any LLM-provided code that is not found in the map is
-        dropped (and warned); any name->code mismatch is warned.
+        The deterministic name->code map is authoritative. LLM-provided codes are
+        only a hint, reconciled as follows:
+          * a code absent from the official list is dropped;
+          * a code that conflicts with a resolved company name (maps to a
+            *different* company) is dropped, so an LLM hallucination can never
+            shadow the correct stock — the chart renderer uses stock_codes[0];
+          * a code that matches a resolved name is deduplicated;
+          * when there are no company names (pure-code query) a verified code is
+            kept as a fallback.
 
-        Args:
-            company_names: Names extracted by the LLM.
-            llm_codes: Codes the LLM may have provided (reverse-verified).
+        Returns ``(final_codes, warnings)``. ``final_codes`` is order-preserving
+        and de-duplicated.
         """
         warnings: list[str] = []
         final: list[str] = []
         seen: set[str] = set()
 
-        for code in llm_codes or []:
-            code = str(code).strip()
-            if not code:
-                continue
-            info = self.verify_code(code)
-            if not info["exists"]:
-                warnings.append(f"LLM-provided code '{code}' not found in stock map")
-                continue
-            if code not in seen:
-                final.append(code)
-                seen.add(code)
-
+        # 1) Resolve names first — the deterministic resolver wins.
         for name in company_names:
             name = (name or "").strip()
             if not name:
@@ -158,23 +152,40 @@ class StockResolver:
                 final.append(resolved_code)
                 seen.add(resolved_code)
 
-        # Cross-check: if the LLM gave a code whose name contradicts a query name.
-        for name in company_names:
-            name = (name or "").strip()
-            if not name:
+        # 2) Reconcile LLM-provided codes against the resolved names.
+        for code in llm_codes or []:
+            code = str(code).strip()
+            if not code:
                 continue
-            for code in llm_codes or []:
-                code = str(code).strip()
-                info = self.verify_code(code)
-                if not info["exists"] or not info["name"]:
-                    continue
-                if self._normalize(name) == self._normalize(info["name"]):
-                    resolved = self.resolve_name(name)
-                    if resolved and code != resolved:
-                        warnings.append(
-                            f"Code mismatch for '{name}': LLM gave '{code}', "
-                            f"map says '{resolved}'"
-                        )
+            info = self.verify_code(code)
+            if not info["exists"]:
+                warnings.append(f"LLM-provided code '{code}' not found in stock map")
+                continue
+            # Already present (consistent with a resolved name) -> dedup only.
+            if code in seen:
+                continue
+            llm_name = info["name"]
+            matches_a_name = any(
+                self._normalize(n) == self._normalize(llm_name) for n in company_names
+            )
+            if matches_a_name:
+                # Consistent but the resolver didn't surface it (e.g. the name is
+                # not in the map yet the code verified) -> keep without dup.
+                final.append(code)
+                seen.add(code)
+                continue
+            if final:
+                # Resolver already produced codes for the queried names, so it is
+                # authoritative: drop the conflicting LLM code rather than let it
+                # shadow the correct stock.
+                warnings.append(
+                    f"LLM code '{code}' ({llm_name}) conflicts with resolved "
+                    f"name(s) {company_names}; dropped in favor of resolver"
+                )
+                continue
+            # Pure-code query (no company names resolved) -> keep verified code.
+            final.append(code)
+            seen.add(code)
 
         return final, warnings
 
