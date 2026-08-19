@@ -3,7 +3,13 @@
 import pytest
 from unittest.mock import Mock, patch
 from classifier.boundary import extract_boundary, BoundaryExtractionError
-from classifier.models import BoundaryResult
+from classifier.models import (
+    BoundaryResult,
+    ChartDataRequirement,
+    ChartType,
+    DateRange,
+    TimeScope,
+)
 from classifier.llm_client import LLMError
 
 
@@ -155,6 +161,101 @@ class TestBoundaryExtraction:
 
         assert result.stock_codes == ["3008"]
         assert result.company_names == ["大立光"]
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_reconciles_flaky_relative_to_absolute(
+        self, mock_llm_client_class
+    ):
+        """A year-anchored range the LLM wrongly tagged 'relative' is corrected.
+
+        Regression for the report where '和益 2024年 1~6月趨勢圖' was extracted as
+        relative/6M (last 6 months) instead of absolute 2024 H1, producing a chart
+        for the wrong historical window.
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        expected_result = BoundaryResult(
+            stock_codes=[],
+            company_names=["和益"],
+            date_range=DateRange(type=TimeScope.RELATIVE, value="6M"),
+            time_scope=TimeScope.RELATIVE,
+            confidence=0.9,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("和益 2024年 1~6月趨勢圖")
+
+        assert result.stock_codes == ["1709"]
+        assert result.date_range is not None
+        assert result.date_range.type == TimeScope.ABSOLUTE
+        assert result.date_range.value == "2024-01-01/2024-06-30"
+        assert result.time_scope == TimeScope.ABSOLUTE
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_sets_chart_data_requirements(
+        self, mock_llm_client_class
+    ):
+        """Boundary output carries validated chart_data_requirements (修 F).
+
+        The chart decision is derived at Step 1 from question keywords via the
+        same ChartValidator logic used on classification, so STEP BOUNDRY shows
+        the final chart requirement rather than the LLM's raw guess.
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        # LLM emitted no chart hint at all; reconciliation must derive it.
+        expected_result = BoundaryResult(
+            stock_codes=["2330"],
+            company_names=["台積電"],
+            confidence=0.9,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("台積電股價走勢圖")
+
+        assert result.chart_data_requirements == ChartDataRequirement.PRICE_TREND
+        assert result.chart_type == ChartType.LINE
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_corrects_chart_type_to_kline(
+        self, mock_llm_client_class
+    ):
+        """A wrong LLM chart_type hint is forced to match the requirement (修 F)."""
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        expected_result = BoundaryResult(
+            stock_codes=["2330"],
+            company_names=["台積電"],
+            confidence=0.9,
+            chart_type=ChartType.LINE,  # LLM guessed wrong
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("台積電K線圖")
+
+        assert result.chart_data_requirements == ChartDataRequirement.PRICE_OHLC
+        assert result.chart_type == ChartType.KLINE
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_clears_chart_fields_without_visual_wording(
+        self, mock_llm_client_class
+    ):
+        """No chart wording -> chart_data_requirements/chart_type cleared (修 F)."""
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        # LLM wrongly left a chart hint on a non-chart question.
+        expected_result = BoundaryResult(
+            stock_codes=["2330"],
+            company_names=["台積電"],
+            confidence=0.9,
+            chart_type=ChartType.LINE,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("台積電現在股價多少")
+
+        assert result.chart_data_requirements is None
+        assert result.chart_type is None
 
 
 if __name__ == "__main__":
