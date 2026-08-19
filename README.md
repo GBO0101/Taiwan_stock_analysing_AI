@@ -27,6 +27,8 @@ classify-twse-query/
 │   ├── finmind_client.py
 │   ├── pipeline.py
 │   ├── boundary.py
+│   ├── chart_validator.py
+│   ├── stock_resolver.py
 │   ├── classification.py
 │   ├── decomposition.py
 │   ├── indicator_mapper.py
@@ -59,6 +61,8 @@ classify-twse-query/
 2. **Step 2 — Classification**: Determine query type (live/factual/analytical/non_financial) and visualization needs
 3. **Step 3 — Decomposition** (conditional): Convert analytical questions into executable FinMind query DAG
 
+The **boundary output** is the single source of truth for charting: its `chart_data_requirements` (reconciled by `chart_validator` keywords) decides the chart type, not the classification step.
+
 ## Configuration
 
 The LLM layer is **vendor-neutral**: it speaks the OpenAI-compatible Chat
@@ -78,6 +82,8 @@ Charts are rendered from **free TWSE open APIs** (no API key required):
 
 - Price / K-line / volume → TWSE `STOCK_DAY`
 - PE ratio / sector analysis → TWSE `BWIBBU`
+
+The K-line (candlestick) chart overlays a **blue dashed daily-average trend line** (mean of each day's open/high/low/close).
 
 Monthly **revenue** charts are NOT available from the free source (MOPS blocks
 unauthenticated access). They require a paid FinMind account:

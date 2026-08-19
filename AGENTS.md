@@ -13,7 +13,9 @@ Python ≥3.10, FastAPI backend + static `frontend/`, LLM-driven via an OpenAI-c
 classify-twse-query/
 ├── classifier/            # importable package: the whole pipeline lives here
 │   ├── pipeline.py        # Pipeline.run(): STRICT sequential orchestrator (Steps 1-3)
-│   ├── boundary.py        # Step 1: entity/scope/time/metric extraction
+│   ├── boundary.py        # Step 1: entity/scope/time/metric extraction; chart fields reconciled here (chart source of truth)
+│   ├── chart_validator.py  # keyword → ChartDataRequirement + enforced chart_type (used by boundary)
+│   ├── stock_resolver.py   # authoritative company_name ↔ stock_code resolver (singleton)
 │   ├── classification.py  # Step 2: query type + visualization needs
 │   ├── decomposition.py   # Step 3 (conditional): analytical → sub-query DAG
 │   ├── models.py          # Pydantic contracts + enums (single source of truth)
@@ -22,7 +24,7 @@ classify-twse-query/
 │   ├── indicator_mapper.py# loads table.csv → indicator→dataset/field map
 │   ├── data_fetcher.py    # FREE TWSE fetcher (STOCK_DAY, BWIBBU); no key
 │   ├── finmind_client.py  # paid FinMind client (charts only — see ANTI-PATTERNS)
-│   ├── chart_renderer.py  # matplotlib chart writer → output/charts/*.png
+│   ├── chart_renderer.py  # matplotlib chart writer → output/charts/*.png; K-line draws a daily-average trend line
 │   ├── config.py          # pydantic-settings; imports .env
 │   ├── cli.py             # `python -m classifier.cli` entry point
 │   └── api.py             # FastAPI app (endpoints below)
@@ -44,6 +46,7 @@ classify-twse-query/
 | Change pipeline order/flow | `classifier/pipeline.py` (`Pipeline.run`, ~L49) |
 | Add/change an LLM step | the step module + its `prompts/*.j2` template |
 | Add a chart type | `models.py` (`ChartDataRequirement`), `chart_renderer.py` (`_render_*`), `cli.py` (`_build_chart_request`) |
+| Change how a chart is decided | `boundary.py` (`_reconcile_chart_fields`) is the source of truth; cli/api read `boundary.chart_data_requirements` (not classification) |
 | Change indicator mapping | `table.csv` + `classifier/indicator_mapper.py` |
 | Switch LLM provider | `.env` `LLM_BASE_URL` (any OpenAI-compatible `/v1`) — no code change |
 | Tune LLM call (temp/format) | `classifier/llm_client.py` (`extract_structured`, ~L90) |
@@ -62,6 +65,11 @@ classify-twse-query/
 | `PromptManager` | class | prompts.py:16 | Renders `prompts/*.j2` (autoescape off) |
 | `IndicatorMapper` | class | indicator_mapper.py:16 | Loads `table.csv`; global `indicator_mapper` at import |
 | `extract_boundary` / `classify_query` / `decompose_query` | fn | boundary/classification/decomposition.py | One LLM call each, returns a Pydantic model |
+| `StockResolver` | class | stock_resolver.py | Authoritative company_name ↔ stock_code resolver; fills & reverse-verifies `stock_codes` |
+| `ChartValidator` | module | chart_validator.py | Keyword logic → `ChartDataRequirement` + enforced `chart_type` |
+| `BoundaryResult.chart_data_requirements` | field | models.py:256 | Post-reconciliation authoritative chart spec; cli/api render from this (not classification) |
+| `_reconcile_chart_fields` | fn | boundary.py:39 | Validates/corrects chart fields on boundary output — charting source of truth |
+| `ChartRenderer._render_kline` | method | chart_renderer.py:153 | Candlestick chart; overlays a blue dashed daily-average (O/H/L/C mean) trend line |
 
 ## Conventions (deviations from stock Python)
 
@@ -86,7 +94,7 @@ classify-twse-query/
 - **Revenue charts don't work on free data.** `ChartRenderer` routes `REVENUE_TREND`/`REVENUE_COMPARISON` through `FreeDataFetcher.get_month_revenue`, which always raises (MOPS blocks unauthenticated access). They need FinMind wired in — currently they fail.
 - `sentiment.j2` + `PromptManager.render_sentiment` exist but are **not used** by the strict 3-step pipeline (optional/legacy node).
 - Root `finmind_*.py` and `finmind_data/` are standalone data-acquisition utilities, separate from the importable `classifier` package — don't import them into the pipeline.
-- Not a git repo. No CI/Makefile/Dockerfile present.
+- Git repo (branch `master`) tracked at `https://github.com/GBO0101/Taiwan_stock_analysing_AI`. No CI/Makefile/Dockerfile present.
 
 ## Commands
 
