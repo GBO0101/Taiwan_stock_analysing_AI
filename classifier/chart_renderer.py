@@ -195,6 +195,18 @@ class ChartRenderer:
                 linewidth=2,
             )
 
+        # Trend line: each day's average price (mean of O/H/L/C), connected.
+        daily_avg = [(o + h + l + c) / 4 for o, h, l, c in zip(opens, highs, lows, closes)]
+        ax.plot(
+            dates,
+            daily_avg,
+            linewidth=1.5,
+            color="#2563eb",
+            linestyle="--",
+            label="趨勢線 (每日均價)",
+        )
+        ax.legend(loc="upper left")
+
         ax.set_title(f"{stock_code} K線圖", fontsize=14, fontweight="bold")
         ax.set_xlabel("日期")
         ax.set_ylabel("股價 (TWD)")
