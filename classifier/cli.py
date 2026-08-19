@@ -24,38 +24,86 @@ from classifier.models import (
     ChartRequest,
     ChartType,
     ClassificationResult,
+    DateRange,
     PipelineResult,
 )
 from classifier.pipeline import Pipeline, PipelineError
 
 
-def _build_chart_request(result: PipelineResult) -> ChartRequest | None:
-    """Build a ChartRequest from a successful pipeline result, if applicable.
-
-    Returns None when the classification does not request visualization or
-    lacks the required fields.
-    """
+def _get_classification_and_boundary(
+    result: PipelineResult,
+) -> tuple[ClassificationResult | None, dict[str, Any] | None]:
+    """Extract the completed classification and boundary steps from a result."""
     classification: ClassificationResult | None = None
     boundary: dict[str, Any] | None = None
-
     for step in result.steps:
         if step.step == "classification" and step.status == "completed":
             classification = ClassificationResult(**step.output)
         elif step.step == "boundary" and step.status == "completed":
             boundary = step.output
+    return classification, boundary
 
-    if classification is None or not classification.needs_visualization:
+
+def _build_chart_request(result: PipelineResult) -> ChartRequest | None:
+    """Build a ChartRequest from a successful pipeline result, if applicable.
+
+    The boundary output is the single source of truth for charting: its
+    ``chart_data_requirements`` / ``chart_type_placeholder`` (validated by
+    ChartValidator at Step 1) decide both whether a chart is produced and which
+    data source to fetch. Classification only remains the gate for Step 3
+    decomposition.
+    """
+    _, boundary = _get_classification_and_boundary(result)
+
+    if boundary is None:
         return None
-    if classification.chart_data_requirements is None:
+    # Source of truth = boundary's validated chart fields.
+    raw_req = boundary.get("chart_data_requirements")
+    if not raw_req or not boundary.get("stock_codes"):
         return None
-    if not boundary or not boundary.get("stock_codes"):
+    try:
+        req_enum = ChartDataRequirement(raw_req)
+    except ValueError:
         return None
 
-    chart_type = classification.chart_type or ChartType.LINE
+    chart_type_raw = boundary.get("chart_type") or ChartType.LINE
+    try:
+        ct_enum = ChartType(chart_type_raw)
+    except ValueError:
+        ct_enum = ChartType.LINE
+
+    date_range = None
+    dr = boundary.get("date_range")
+    if isinstance(dr, dict) and dr.get("type") and dr.get("value"):
+        try:
+            date_range = DateRange(type=dr["type"], value=dr["value"])
+        except (ValueError, TypeError):
+            date_range = None
     return ChartRequest(
         stock_codes=list(boundary["stock_codes"]),
-        chart_data_requirements=classification.chart_data_requirements,
-        chart_type=chart_type,
+        chart_data_requirements=req_enum,
+        chart_type=ct_enum,
+        date_range=date_range,
+    )
+
+
+def _no_chart_reason(result: PipelineResult) -> str | None:
+    """Return a human-readable reason when no chart is produced despite a viz request.
+
+    Uses the boundary output as the single source of truth for chart intent
+    (its validated ``chart_data_requirements``). Returns None when no chart is
+    expected (boundary has no chart requirement, or a chart was actually built),
+    so the caller only warns on the silent-failure case: visualization requested
+    but no stock code could be resolved.
+    """
+    _, boundary = _get_classification_and_boundary(result)
+    if boundary is None or not boundary.get("chart_data_requirements"):
+        return None
+    if boundary.get("stock_codes"):
+        return None
+    return (
+        "查詢要求產生圖表，但無法從查詢解析出股票代號（stock_codes 為空），"
+        "因此未產生圖表。請確認股票名稱或代號是否正確。"
     )
 
 
@@ -77,6 +125,11 @@ def _run_once(
             if request is not None:
                 renderer = ChartRenderer()
                 chart_path = renderer.render(request)
+            else:
+                reason = _no_chart_reason(result)
+                if reason is not None:
+                    print(f"警告：{reason}", file=sys.stderr)
+                    output["chart_note"] = reason
         except ChartRenderError as e:
             # Chart failure is non-fatal for the pipeline result itself.
             chart_path = None

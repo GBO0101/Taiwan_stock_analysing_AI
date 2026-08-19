@@ -78,7 +78,7 @@ function findStep(steps, name) {
   return steps.find((s) => s.step === name);
 }
 
-async function renderChart(classification, boundary) {
+async function renderChart(boundary) {
   const stockCodes = boundary && boundary.stock_codes ? boundary.stock_codes : [];
   const showArea = () => els.chartContainer.classList.remove("hidden");
   const hideImg = () => els.chartImg.classList.add("hidden");
@@ -90,21 +90,18 @@ async function renderChart(classification, boundary) {
     showChartMessage("查詢未解析出股票代碼，無法產生圖表。", true);
     return;
   }
-  if (!classification || !classification.needs_visualization) {
+  // The boundary output (validated at Step 1) is the single source of truth
+  // for charting; use its chart_data_requirements rather than the classification.
+  if (!boundary || !boundary.chart_data_requirements) {
     els.chartContainer.classList.add("hidden");
-    return;
-  }
-  if (!classification.chart_data_requirements) {
-    showArea();
-    hideImg();
-    showChartMessage("此查詢標記需要圖表，但未指定 chart_data_requirements。", true);
     return;
   }
 
   const body = {
     stock_codes: stockCodes,
-    chart_data_requirements: classification.chart_data_requirements,
-    chart_type: classification.chart_type || "line",
+    chart_data_requirements: boundary.chart_data_requirements,
+    chart_type: boundary.chart_type || "line",
+    date_range: boundary.date_range ? boundary.date_range : null,
   };
 
   try {
@@ -172,10 +169,9 @@ async function submitQuestion() {
     const showJson = els.showJson.checked;
     renderSteps(data, showJson);
 
-    const classification = findStep(data.steps, "classification");
     const boundary = findStep(data.steps, "boundary");
-    if (classification && boundary) {
-      await renderChart(classification.output, boundary.output);
+    if (boundary) {
+      await renderChart(boundary.output);
     }
   } catch (e) {
     showError(`請求失敗: ${e.message}`);
