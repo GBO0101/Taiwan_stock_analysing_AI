@@ -1,7 +1,7 @@
 """Unit tests for pipeline contract models."""
 
 import pytest
-from datetime import date
+from datetime import date, timedelta
 from classifier.models import (
     ClassificationType,
     ChartType,
@@ -68,6 +68,83 @@ class TestDateRange:
         dr = DateRange(type=TimeScope.ABSOLUTE, value="2024-01-01/2024-12-31")
         assert dr.type == TimeScope.ABSOLUTE
         assert dr.value == "2024-01-01/2024-12-31"
+
+    def test_resolve_absolute_range(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024-01-01/2024-05-31")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 5, 31))
+
+    def test_resolve_absolute_month_precision(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024-01/2024-05")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 5, 1))
+
+    def test_resolve_absolute_swapped_bounds(self):
+        # LLM may emit end/start reversed; result must be ordered.
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024-05-31/2024-01-01")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 5, 31))
+
+    def test_resolve_relative_range(self):
+        dr = DateRange(type=TimeScope.RELATIVE, value="30d")
+        start, end = dr.resolve_dates()
+        assert end == date.today()
+        assert (end - start).days == 30
+
+    def test_resolve_relative_units(self):
+        assert DateRange(type=TimeScope.RELATIVE, value="2w").resolve_dates()[1] == date.today()
+        assert DateRange(type=TimeScope.RELATIVE, value="3m").resolve_dates()[1] == date.today()
+        assert DateRange(type=TimeScope.RELATIVE, value="1y").resolve_dates()[1] == date.today()
+
+    def test_resolve_invalid_returns_none(self):
+        assert DateRange(type=TimeScope.ABSOLUTE, value="not-a-date").resolve_dates() is None
+        assert DateRange(type=TimeScope.RELATIVE, value="abc").resolve_dates() is None
+
+    def test_resolve_absolute_single_full_date(self):
+        # A single explicit day resolves to that day (no silent fallback to a
+        # now-based window, which was the original bug).
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024-01-01")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 1, 1))
+
+    def test_resolve_absolute_slash_separators(self):
+        # LLM may emit slashes instead of dashes for both date and range.
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024/01/2024/07")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 7, 1))
+
+    def test_resolve_absolute_word_separator(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024-01-01 to 2024-07-31")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 7, 31))
+
+    def test_resolve_absolute_tilde_separator(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024-01-01~2024-07-31")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 7, 31))
+
+    def test_resolve_absolute_chinese_range(self):
+        # The exact phrasing from the bug report.
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024年1月到7月")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 7, 31))
+
+    def test_resolve_absolute_chinese_full_day(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024年1月1日到7月31日")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 7, 31))
+
+    def test_resolve_absolute_chinese_tilde_range(self):
+        # "1~6月" uses a tilde separator between months; must span Jan-Jun.
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024年 1~6月")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 6, 30))
+
+    def test_resolve_absolute_chinese_dash_range(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024年1月-7月")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 7, 31))
+
+    def test_resolve_absolute_single_month_expands(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024-01")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 1, 31))
+
+    def test_resolve_absolute_single_year_expands(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 12, 31))
+
+    def test_resolve_absolute_chinese_year_only(self):
+        dr = DateRange(type=TimeScope.ABSOLUTE, value="2024年")
+        assert dr.resolve_dates() == (date(2024, 1, 1), date(2024, 12, 31))
 
 
 class TestBoundaryResult:
@@ -325,6 +402,31 @@ class TestChartRequest:
         )
         assert cr.start_date is None
         assert cr.end_date is None
+
+    def test_date_range_resolves_to_start_end(self):
+        # A ChartRequest built from a pipeline date_range must populate the
+        # concrete start/end dates the renderer consumes (bug: chart ignored
+        # the requested range and showed the current period instead).
+        cr = ChartRequest(
+            stock_codes=["2330"],
+            chart_data_requirements=ChartDataRequirement.PRICE_TREND,
+            chart_type=ChartType.LINE,
+            date_range=DateRange(type=TimeScope.ABSOLUTE, value="2024-01-01/2024-05-31"),
+        )
+        assert cr.start_date == date(2024, 1, 1)
+        assert cr.end_date == date(2024, 5, 31)
+
+    def test_explicit_dates_take_precedence_over_range(self):
+        cr = ChartRequest(
+            stock_codes=["2330"],
+            chart_data_requirements=ChartDataRequirement.PRICE_TREND,
+            chart_type=ChartType.LINE,
+            start_date=date(2023, 1, 1),
+            end_date=date(2023, 12, 31),
+            date_range=DateRange(type=TimeScope.ABSOLUTE, value="2024-01-01/2024-05-31"),
+        )
+        assert cr.start_date == date(2023, 1, 1)
+        assert cr.end_date == date(2023, 12, 31)
 
 
 if __name__ == "__main__":
