@@ -371,10 +371,47 @@ class DecompositionResult(BaseModel):
         return v
 
 
+class StockItem(BaseModel):
+    """A single stock identified by code and Chinese name."""
+
+    code: str = Field(..., description="TWSE stock code (e.g., '2330')")
+    name: str = Field(..., description="Company Chinese name (e.g., '台積電')")
+
+
+class RangeQueryType(str, Enum):
+    """Range stock enumeration query types."""
+
+    SECTOR = "sector"
+    INDEX = "index"
+    MARKET = "market"
+
+
+class RangeStockResult(BaseModel):
+    """Step 4 output (range mode): all stocks matching a sector/index/market."""
+
+    query_type: RangeQueryType = Field(..., description="Range query type")
+    query_value: str = Field(..., description="Range value (e.g., '半導體', '台灣50')")
+    stocks: list[StockItem] = Field(default_factory=list, description="Matching stocks")
+    source: str = Field(..., description="Data source: combined|twse_api|tip|llm")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Result confidence")
+    matched_industry: Optional[str] = Field(default=None, description="Resolved industry name")
+
+
+class RelatedStockResult(BaseModel):
+    """Step 4 output (related mode): upstream/downstream of a single stock."""
+
+    stock_code: str = Field(..., description="Target stock code")
+    stock_name: str = Field(..., description="Target stock name")
+    upstream: list[StockItem] = Field(default_factory=list, description="Direct upstream suppliers (1 layer)")
+    downstream: list[StockItem] = Field(default_factory=list, description="Direct downstream customers (1 layer)")
+    source: str = Field(default="llm", description="Data source (supply chain is LLM-inferred)")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Result confidence")
+
+
 class PipelineStepResult(BaseModel):
     """Single pipeline step result for trace."""
 
-    step: str = Field(..., description="Step name: boundary, classification, decomposition")
+    step: str = Field(..., description="Step name: boundary, classification, decomposition, stock_enumeration")
     status: StepStatus = Field(..., description="Step execution status")
     output: dict[str, Any] = Field(default_factory=dict, description="Step output data")
 
