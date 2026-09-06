@@ -2,32 +2,32 @@
 
 from __future__ import annotations
 
-import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
+from classifier import api as api_module
 from classifier.llm_client import LLMError
 from classifier.models import (
     BoundaryResult,
-    ChartRequest,
     ChartDataRequirement,
+    ChartRequest,
     ChartType,
     ClassificationResult,
     ClassificationType,
     DecompositionResult,
     SubQuery,
 )
-from classifier.pipeline import Pipeline, PipelineError
-from classifier import api as api_module
+from classifier.pipeline import Pipeline
+from classifier.stock_enumeration import _RangeValidationModel, _SupplyChainModel
 
 
-def _fake_llm(needs_viz=False, chart_req=None, chart_type=None, ctype=ClassificationType.ANALYTICAL):
+def _fake_llm(
+    needs_viz=False, chart_req=None, chart_type=None, ctype=ClassificationType.ANALYTICAL
+):
     fake = MagicMock()
-    boundary = BoundaryResult(
-        stock_codes=["2330"], company_names=["台積電"], confidence=0.9
-    )
+    boundary = BoundaryResult(stock_codes=["2330"], company_names=["台積電"], confidence=0.9)
     classification = ClassificationResult(
         type=ctype,
         confidence=0.9,
@@ -38,12 +38,16 @@ def _fake_llm(needs_viz=False, chart_req=None, chart_type=None, ctype=Classifica
     decomposition = DecompositionResult(
         sub_queries=[SubQuery(id="q0", operation="finmind_query", datasets=["TaiwanStockPrice"])]
     )
+    supply_chain = _SupplyChainModel(upstream=[], downstream=[], confidence=0.3)
+    range_validation = _RangeValidationModel(confidence=0.6)
 
     def extract(prompt, response_model):
         return {
             "BoundaryResult": boundary,
             "ClassificationResult": classification,
             "DecompositionResult": decomposition,
+            "_SupplyChainModel": supply_chain,
+            "_RangeValidationModel": range_validation,
         }[response_model.__name__]
 
     fake.extract_structured.side_effect = extract
@@ -65,7 +69,10 @@ def test_health_no_external_calls(client):
 
 def test_pipeline_endpoint_returns_trace(client):
     fake = _fake_llm()
-    with patch("classifier.api.Pipeline", return_value=MagicMock(run=lambda question: PipelineResult_for_test(fake))):
+    with patch(
+        "classifier.api.Pipeline",
+        return_value=MagicMock(run=lambda question: PipelineResult_for_test(fake)),
+    ):
         # Build a real PipelineResult via the actual Pipeline with the fake client.
         from classifier.pipeline import Pipeline
 
@@ -76,7 +83,7 @@ def test_pipeline_endpoint_returns_trace(client):
         data = resp.json()
         assert data["question"] == "台積電未來展望"
         steps = [s["step"] for s in data["steps"]]
-        assert steps == ["boundary", "classification", "decomposition"]
+        assert steps == ["boundary", "classification", "decomposition", "stock_enumeration"]
 
 
 def test_pipeline_endpoint_missing_question(client):
@@ -85,7 +92,6 @@ def test_pipeline_endpoint_missing_question(client):
 
 
 def test_pipeline_endpoint_pipeline_error(client):
-    from classifier.pipeline import PipelineError
 
     fake = _fake_llm()
     fake.extract_structured.side_effect = LLMError("boom")

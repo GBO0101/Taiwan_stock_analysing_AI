@@ -16,10 +16,10 @@ from classifier.models import (
     ClassificationResult,
     ClassificationType,
     DecompositionResult,
-    PipelineResult,
     SubQuery,
 )
 from classifier.pipeline import Pipeline, PipelineError
+from classifier.stock_enumeration import _RangeValidationModel, _SupplyChainModel
 
 
 class FakeLLMClient:
@@ -33,7 +33,9 @@ class FakeLLMClient:
             type=ClassificationType.ANALYTICAL, confidence=0.9
         )
         self.decomposition = decomposition or DecompositionResult(
-            sub_queries=[SubQuery(id="q0", operation="finmind_query", datasets=["TaiwanStockPrice"])]
+            sub_queries=[
+                SubQuery(id="q0", operation="finmind_query", datasets=["TaiwanStockPrice"])
+            ]
         )
         # Which step should raise: "boundary", "classification", or "decomposition"
         self.fail_on = fail_on or set()
@@ -54,6 +56,10 @@ class FakeLLMClient:
             if "decomposition" in self.fail_on:
                 raise LLMError("forced decomposition failure")
             return self.decomposition
+        if name == "_SupplyChainModel":
+            return _SupplyChainModel(upstream=[], downstream=[], confidence=0.3)
+        if name == "_RangeValidationModel":
+            return _RangeValidationModel(confidence=0.6)
         raise RuntimeError(f"unexpected model {name}")
 
 
@@ -88,8 +94,10 @@ def test_non_analytical_skips_step3():
     result = _pipeline_with(fake).run("台積電現在股價多少")
     assert "DecompositionResult" not in fake.calls
     types = [s.step for s in result.steps]
-    assert types == ["boundary", "classification", "decomposition"]
+    assert types == ["boundary", "classification", "decomposition", "stock_enumeration"]
     assert result.steps[2].status == "skipped"
+    # Single-stock live query still triggers stock enumeration (supply chain).
+    assert result.steps[3].status == "completed"
 
 
 def test_factual_skips_step3():
@@ -108,6 +116,9 @@ def test_non_financial_skips_step3():
     result = _pipeline_with(fake).run("香蕉好吃嗎")
     assert "DecompositionResult" not in fake.calls
     assert result.steps[2].status == "skipped"
+    # NON_FINANCIAL must skip Step 4 too, regardless of boundary scope.
+    assert result.steps[3].step == "stock_enumeration"
+    assert result.steps[3].status == "skipped"
 
 
 def test_analytical_runs_step3():
@@ -117,6 +128,9 @@ def test_analytical_runs_step3():
     result = _pipeline_with(fake).run("台積電未來展望如何")
     assert "DecompositionResult" in fake.calls
     assert result.steps[2].status == "completed"
+    # Single stock still triggers Step 4 (supply chain) after decomposition.
+    assert result.steps[3].step == "stock_enumeration"
+    assert result.steps[3].status == "completed"
 
 
 def test_step2_failure_blocks_step3():

@@ -1,22 +1,23 @@
 """Unit tests for Pipeline Runner."""
 
-import pytest
 from unittest.mock import Mock, patch
-from classifier.pipeline import Pipeline, PipelineError
-from classifier.models import (
-    BoundaryResult,
-    ClassificationResult,
-    DecompositionResult,
-    PipelineResult,
-    PipelineStepResult,
-    StepStatus,
-    ClassificationType,
-    SubQuery,
-    OperationType,
-)
+
+import pytest
+
 from classifier.boundary import BoundaryExtractionError
 from classifier.classification import ClassificationError
 from classifier.decomposition import DecompositionError
+from classifier.models import (
+    BoundaryResult,
+    ClassificationResult,
+    ClassificationType,
+    DecompositionResult,
+    OperationType,
+    StepStatus,
+    SubQuery,
+)
+from classifier.pipeline import Pipeline, PipelineError
+from classifier.stock_enumeration import _SupplyChainModel
 
 
 class TestPipeline:
@@ -53,19 +54,26 @@ class TestPipeline:
             ]
         )
 
-        mock_llm.extract_structured.side_effect = [boundary, classification, decomposition]
+        mock_llm.extract_structured.side_effect = [
+            boundary,
+            classification,
+            decomposition,
+            _SupplyChainModel(upstream=[], downstream=[], confidence=0.3),
+        ]
 
         pipeline = Pipeline(llm_client=mock_llm, indicator_mapper=mock_mapper)
         result = pipeline.run("台積電近五年獲利能力如何")
 
         assert result.question == "台積電近五年獲利能力如何"
-        assert len(result.steps) == 3
+        assert len(result.steps) == 4
         assert result.steps[0].step == "boundary"
         assert result.steps[0].status == StepStatus.COMPLETED
         assert result.steps[1].step == "classification"
         assert result.steps[1].status == StepStatus.COMPLETED
         assert result.steps[2].step == "decomposition"
         assert result.steps[2].status == StepStatus.COMPLETED
+        assert result.steps[3].step == "stock_enumeration"
+        assert result.steps[3].status == StepStatus.COMPLETED
 
     @patch("classifier.pipeline.LLMClient")
     @patch("classifier.pipeline.IndicatorMapper")
@@ -86,14 +94,19 @@ class TestPipeline:
             confidence=0.9,
         )
 
-        mock_llm.extract_structured.side_effect = [boundary, classification]
+        mock_llm.extract_structured.side_effect = [
+            boundary,
+            classification,
+            _SupplyChainModel(upstream=[], downstream=[], confidence=0.3),
+        ]
 
         pipeline = Pipeline(llm_client=mock_llm, indicator_mapper=mock_mapper)
         result = pipeline.run("台積電現在股價多少")
 
-        assert len(result.steps) == 3
+        assert len(result.steps) == 4
         assert result.steps[2].step == "decomposition"
         assert result.steps[2].status == StepStatus.SKIPPED
+        assert result.steps[3].step == "stock_enumeration"
 
     @patch("classifier.pipeline.LLMClient")
     @patch("classifier.pipeline.IndicatorMapper")
@@ -114,13 +127,19 @@ class TestPipeline:
             confidence=0.85,
         )
 
-        mock_llm.extract_structured.side_effect = [boundary, classification]
+        mock_llm.extract_structured.side_effect = [
+            boundary,
+            classification,
+            _SupplyChainModel(upstream=[], downstream=[], confidence=0.3),
+        ]
 
         pipeline = Pipeline(llm_client=mock_llm, indicator_mapper=mock_mapper)
         result = pipeline.run("台積電2024年EPS是多少")
 
-        assert len(result.steps) == 3
+        assert len(result.steps) == 4
         assert result.steps[2].status == StepStatus.SKIPPED
+        assert result.steps[3].step == "stock_enumeration"
+        assert result.steps[3].status == StepStatus.COMPLETED
 
     @patch("classifier.pipeline.LLMClient")
     @patch("classifier.pipeline.IndicatorMapper")
@@ -146,8 +165,10 @@ class TestPipeline:
         pipeline = Pipeline(llm_client=mock_llm, indicator_mapper=mock_mapper)
         result = pipeline.run("香蕉好吃嗎")
 
-        assert len(result.steps) == 3
+        assert len(result.steps) == 4
         assert result.steps[2].status == StepStatus.SKIPPED
+        assert result.steps[3].step == "stock_enumeration"
+        assert result.steps[3].status == StepStatus.SKIPPED
 
     @patch("classifier.pipeline.LLMClient")
     @patch("classifier.pipeline.IndicatorMapper")
@@ -175,7 +196,10 @@ class TestPipeline:
         mock_mapper_class.return_value = mock_mapper
 
         boundary = BoundaryResult(stock_codes=["2330"], confidence=0.95)
-        mock_llm.extract_structured.side_effect = [boundary, ClassificationError("Classification failed")]
+        mock_llm.extract_structured.side_effect = [
+            boundary,
+            ClassificationError("Classification failed"),
+        ]
 
         pipeline = Pipeline(llm_client=mock_llm, indicator_mapper=mock_mapper)
 
@@ -227,11 +251,15 @@ class TestPipeline:
             confidence=0.9,
         )
 
-        mock_llm.extract_structured.side_effect = [boundary, classification]
+        mock_llm.extract_structured.side_effect = [
+            boundary,
+            classification,
+            _SupplyChainModel(upstream=[], downstream=[], confidence=0.3),
+        ]
 
         context = {
             "last_question": "台積電",
-            "last_boundary": {"stock_codes": ["2330"], "company_names": ["台積電"]}
+            "last_boundary": {"stock_codes": ["2330"], "company_names": ["台積電"]},
         }
 
         pipeline = Pipeline(llm_client=mock_llm, indicator_mapper=mock_mapper)
@@ -239,6 +267,9 @@ class TestPipeline:
 
         assert result.question == "它最近股價如何？"
         assert result.steps[0].status == StepStatus.COMPLETED
+        # Single-stock live query runs Step 4 (supply chain).
+        assert result.steps[3].step == "stock_enumeration"
+        assert result.steps[3].status == StepStatus.COMPLETED
 
 
 if __name__ == "__main__":
