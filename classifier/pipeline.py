@@ -1,4 +1,4 @@
-"""Pipeline runner: orchestrates Steps 1-3 in strict sequential order."""
+"""Pipeline runner: orchestrates Steps 1-4 in strict sequential order."""
 
 from typing import Any
 from classifier.models import (
@@ -9,10 +9,13 @@ from classifier.models import (
     PipelineStepResult,
     StepStatus,
     ClassificationType,
+    StockScope,
 )
 from classifier.boundary import extract_boundary, BoundaryExtractionError
 from classifier.classification import classify_query, ClassificationError
 from classifier.decomposition import decompose_query, DecompositionError
+from classifier.stock_enumeration import StockEnumeration, StockEnumerationError
+from classifier.isin_client import IsinClient
 from classifier.llm_client import LLMClient
 from classifier.indicator_mapper import IndicatorMapper
 
@@ -26,25 +29,29 @@ class PipelineError(Exception):
 class Pipeline:
     """Strict sequential pipeline runner for Taiwan-stock query understanding.
 
-    Executes Steps 1-3 in order:
+    Executes Steps 1-4 in order:
     1. Boundary Extraction
     2. Classification
     3. Decomposition (conditional - only for analytical queries)
+    4. Stock Enumeration (conditional - when scope/stock codes present)
     """
 
     def __init__(
         self,
         llm_client: LLMClient | None = None,
         indicator_mapper: IndicatorMapper | None = None,
+        isin_client: IsinClient | None = None,
     ):
         """Initialize pipeline.
 
         Args:
             llm_client: Optional LLM client (creates default if not provided)
             indicator_mapper: Optional indicator mapper (creates default if not provided)
+            isin_client: Optional ISIN client (creates default if not provided)
         """
         self.llm_client = llm_client or LLMClient()
         self.indicator_mapper = indicator_mapper or IndicatorMapper()
+        self.enumeration = StockEnumeration(llm_client=self.llm_client, isin=isin_client)
 
     def run(
         self,
@@ -132,6 +139,38 @@ class Pipeline:
                 step="decomposition",
                 status=StepStatus.SKIPPED,
                 output={"reason": f"Skipped: classification type is {classification.type}"},
+            ))
+
+        # Step 4: Stock Enumeration (conditional)
+        should_enumerate = (
+            classification.type != ClassificationType.NON_FINANCIAL
+            and (
+                len(boundary.stock_codes) > 0
+                or len(boundary.sectors) > 0
+                or boundary.stock_scope in (StockScope.SECTOR, StockScope.MARKET)
+            )
+        )
+
+        if should_enumerate:
+            try:
+                enum_result = self.enumeration.run(question=question, boundary=boundary)
+                steps.append(PipelineStepResult(
+                    step="stock_enumeration",
+                    status=StepStatus.COMPLETED,
+                    output=enum_result.model_dump(),
+                ))
+            except StockEnumerationError as e:
+                steps.append(PipelineStepResult(
+                    step="stock_enumeration",
+                    status=StepStatus.FAILED,
+                    output={"error": str(e)},
+                ))
+                raise PipelineError(f"Step 4 (Stock Enumeration) failed: {e}") from e
+        else:
+            steps.append(PipelineStepResult(
+                step="stock_enumeration",
+                status=StepStatus.SKIPPED,
+                output={"reason": "Skipped: no scope/stock codes or non-financial query"},
             ))
 
         return PipelineResult(
