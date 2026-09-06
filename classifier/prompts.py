@@ -92,6 +92,24 @@ class PromptManager:
             classification=classification,
         )
 
+    def render_stock_validation(
+        self,
+        query_value: str,
+        query_type: str,
+        stocks: list[dict],
+    ) -> str:
+        """Render the range-mode stock-list validation prompt."""
+        return self.render(
+            "stock_validation.j2",
+            query_value=query_value,
+            query_type=query_type,
+            stocks=stocks,
+        )
+
+    def render_supply_chain(self, stock_code: str, stock_name: str) -> str:
+        """Render the supply-chain (upstream/downstream) inference prompt."""
+        return self.render("supply_chain.j2", stock_code=stock_code, stock_name=stock_name)
+
 
 # Global instance
 prompt_manager = PromptManager()
