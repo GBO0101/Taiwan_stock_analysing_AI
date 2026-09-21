@@ -19,6 +19,11 @@ Classify the user's question into ONE of four types and determine visualization 
 4. **non_financial**: Question is outside supported Taiwan-stock domain.
    - Example: "香蕉好吃嗎"
    - Boundary guardrail - NOT general chat
+   - IMPORTANT: Questions about a stock's supply chain / counterparties
+     (上下游, 供應商, 客戶, 名單, supply chain), annual-report disclosures,
+     or industry relationships ARE in-domain financial queries — never
+     classify them as non_financial. If the boundary extraction resolved a
+     stock code or sector, the question is not non_financial.
 
 ## Visualization Rules (INDEPENDENT of classification)
 

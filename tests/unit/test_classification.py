@@ -1,11 +1,13 @@
 """Unit tests for Step 2 Query Classification."""
 
-import pytest
 from unittest.mock import Mock, patch
-from classifier.classification import classify_query, ClassificationError
+
+import pytest
+
 from classifier.boundary import extract_boundary
-from classifier.models import BoundaryResult, ClassificationResult, ClassificationType
+from classifier.classification import ClassificationError, classify_query
 from classifier.llm_client import LLMError
+from classifier.models import BoundaryResult, ClassificationResult, ClassificationType
 
 
 class TestClassification:
@@ -112,6 +114,63 @@ class TestClassification:
 
         assert result.type == ClassificationType.NON_FINANCIAL
         assert result.target_datasets == []
+
+    @patch("classifier.classification.LLMClient")
+    def test_classify_corrects_non_financial_when_stock_resolved(self, mock_llm_client_class):
+        """NON_FINANCIAL with resolved stock scope is corrected to FACTUAL.
+
+        The local model sometimes tags "南亞2024年上下游名單" as non_financial,
+        which skipped Step 4 (stock enumeration) entirely even though the
+        boundary had already resolved 南亞 -> 1303. A question naming a known
+        Taiwan stock is in-domain by definition.
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+
+        boundary = BoundaryResult(
+            stock_codes=["1303"],
+            company_names=["南亞"],
+            date_range={"type": "absolute", "value": "2024-01-01/2024-12-31"},
+            time_scope="absolute",
+            confidence=0.9,
+        )
+        expected_result = ClassificationResult(
+            type=ClassificationType.NON_FINANCIAL,
+            confidence=0.0,
+            needs_visualization=False,
+            target_datasets=[""],
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = classify_query("南亞2024年上下游名單", boundary)
+
+        assert result.type == ClassificationType.FACTUAL
+        assert result.confidence >= 0.5
+        assert result.needs_visualization is False
+
+    @patch("classifier.classification.LLMClient")
+    def test_classify_keeps_non_financial_without_scope(self, mock_llm_client_class):
+        """NON_FINANCIAL without any resolved scope stays NON_FINANCIAL.
+
+        Guards the guardrail: "香蕉好吃嗎" with an empty boundary must not be
+        promoted to a financial type.
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+
+        boundary = BoundaryResult(stock_codes=[], company_names=[], confidence=0.3)
+        expected_result = ClassificationResult(
+            type=ClassificationType.NON_FINANCIAL,
+            confidence=0.8,
+            needs_visualization=False,
+            target_datasets=[],
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = classify_query("香蕉好吃嗎", boundary)
+
+        assert result.type == ClassificationType.NON_FINANCIAL
+        assert result.confidence == 0.8
 
     @patch("classifier.classification.LLMClient")
     def test_classify_with_clarification(self, mock_llm_client_class):
