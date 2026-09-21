@@ -1,8 +1,11 @@
 """Unit tests for Step 1 Boundary Extraction."""
 
-import pytest
 from unittest.mock import Mock, patch
-from classifier.boundary import extract_boundary, BoundaryExtractionError
+
+import pytest
+
+from classifier.boundary import BoundaryExtractionError, extract_boundary
+from classifier.llm_client import LLMError
 from classifier.models import (
     BoundaryResult,
     ChartDataRequirement,
@@ -10,7 +13,6 @@ from classifier.models import (
     DateRange,
     TimeScope,
 )
-from classifier.llm_client import LLMError
 
 
 class TestBoundaryExtraction:
@@ -79,7 +81,7 @@ class TestBoundaryExtraction:
 
         context = {
             "last_question": "台積電",
-            "last_boundary": {"stock_codes": ["2330"], "company_names": ["台積電"]}
+            "last_boundary": {"stock_codes": ["2330"], "company_names": ["台積電"]},
         }
         result = extract_boundary("它最近股價如何？", context=context)
 
@@ -163,9 +165,7 @@ class TestBoundaryExtraction:
         assert result.company_names == ["大立光"]
 
     @patch("classifier.boundary.LLMClient")
-    def test_extract_boundary_reconciles_flaky_relative_to_absolute(
-        self, mock_llm_client_class
-    ):
+    def test_extract_boundary_reconciles_flaky_relative_to_absolute(self, mock_llm_client_class):
         """A year-anchored range the LLM wrongly tagged 'relative' is corrected.
 
         Regression for the report where '和益 2024年 1~6月趨勢圖' was extracted as
@@ -192,9 +192,143 @@ class TestBoundaryExtraction:
         assert result.time_scope == TimeScope.ABSOLUTE
 
     @patch("classifier.boundary.LLMClient")
-    def test_extract_boundary_sets_chart_data_requirements(
+    def test_extract_boundary_reconciles_null_date_range_from_year(self, mock_llm_client_class):
+        """A year-anchored question whose date_range the LLM left null is fixed.
+
+        The /v1 JSON-mode path of the local model emits ``date_range: null``
+        even when the question names a specific year ("南亞2024年上下游名單").
+        The deterministic reconciliation must derive the absolute window from
+        the question text (gap: data_range never detected).
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        expected_result = BoundaryResult(
+            stock_codes=[],
+            company_names=["南亞"],
+            date_range=None,  # LLM returned null
+            time_scope=None,
+            confidence=0.9,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("南亞2024年上下游名單")
+
+        assert result.stock_codes == ["1303"]
+        assert result.date_range is not None
+        assert result.date_range.type == TimeScope.ABSOLUTE
+        assert result.date_range.value == "2024-01-01/2024-12-31"
+        assert result.time_scope == TimeScope.ABSOLUTE
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_reconciles_null_date_range_from_bare_year_context(
         self, mock_llm_client_class
     ):
+        """A bare 4-digit year + supply-chain context (no 年 suffix) anchors.
+
+        "南亞2024上下游名單" has no "年" character, so the year-anchored regex
+        ``\\d{{4}}\\s*年`` alone misses it. Without the deterministic fallback
+        the pipeline falls back to the newest annual report (FY 114) and only
+        the top supplier survives; with it, FY 113 (南亞 2024) is used and
+        every listed supplier (incl. 金益鼎 8390 from 主要原料之供應狀況) shows up.
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        expected_result = BoundaryResult(
+            stock_codes=[],
+            company_names=["南亞"],
+            date_range=None,  # LLM returned null
+            time_scope=None,
+            confidence=0.9,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("南亞2024上下游名單")
+
+        assert result.stock_codes == ["1303"]
+        assert result.date_range is not None
+        assert result.date_range.type == TimeScope.ABSOLUTE
+        assert result.date_range.value == "2024-01-01/2024-12-31"
+        assert result.time_scope == TimeScope.ABSOLUTE
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_does_not_anchor_bare_stock_code(self, mock_llm_client_class):
+        """A 4-digit stock code beside a supply-chain keyword is not a year.
+
+        "台塑1303供應商" could read as a bare-year + context pattern; the
+        year-range guard (1990-2040) must reject 1303 so the question keeps
+        its (null) range instead of inventing year 1303.
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        expected_result = BoundaryResult(
+            stock_codes=[],
+            company_names=["台塑"],
+            date_range=None,
+            time_scope=None,
+            confidence=0.9,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("台塑1303供應商")
+
+        assert result.stock_codes == ["1301"]
+        assert result.date_range is None
+        assert result.time_scope is None
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_reconciles_null_date_range_from_minguo_year(
+        self, mock_llm_client_class
+    ):
+        """民國年 (ROC-era) forms are reconciled to Gregorian absolute ranges.
+
+        "民國113年" maps to Gregorian 2024. The previous regex required a month
+        after a 4-digit year, so both "民國113年度年報" and bare "2024年" missed
+        the anchor entirely.
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        expected_result = BoundaryResult(
+            stock_codes=[],
+            company_names=["台塑"],
+            date_range=None,
+            time_scope=None,
+            confidence=0.9,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("台塑民國113年度年報揭露的供應商與客戶有哪些")
+
+        assert result.stock_codes == ["1301"]
+        assert result.date_range is not None
+        assert result.date_range.type == TimeScope.ABSOLUTE
+        assert result.date_range.value == "2024-01-01/2024-12-31"
+        assert result.time_scope == TimeScope.ABSOLUTE
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_null_date_range_without_year_stays_null(self, mock_llm_client_class):
+        """No year anchor in the question -> reconciliation leaves null alone.
+
+        Guards against inventing a window for questions like "台塑現在股價多少".
+        """
+        mock_client = Mock()
+        mock_llm_client_class.return_value = mock_client
+        expected_result = BoundaryResult(
+            stock_codes=[],
+            company_names=["台塑"],
+            date_range=None,
+            time_scope=None,
+            confidence=0.9,
+        )
+        mock_client.extract_structured.return_value = expected_result
+
+        result = extract_boundary("台塑現在股價多少")
+
+        assert result.stock_codes == ["1301"]
+        assert result.date_range is None
+        assert result.time_scope is None
+
+    @patch("classifier.boundary.LLMClient")
+    def test_extract_boundary_sets_chart_data_requirements(self, mock_llm_client_class):
         """Boundary output carries validated chart_data_requirements (修 F).
 
         The chart decision is derived at Step 1 from question keywords via the
@@ -217,9 +351,7 @@ class TestBoundaryExtraction:
         assert result.chart_type == ChartType.LINE
 
     @patch("classifier.boundary.LLMClient")
-    def test_extract_boundary_corrects_chart_type_to_kline(
-        self, mock_llm_client_class
-    ):
+    def test_extract_boundary_corrects_chart_type_to_kline(self, mock_llm_client_class):
         """A wrong LLM chart_type hint is forced to match the requirement (修 F)."""
         mock_client = Mock()
         mock_llm_client_class.return_value = mock_client

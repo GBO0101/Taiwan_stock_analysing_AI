@@ -1,10 +1,15 @@
 """Step 1: Boundary Extraction."""
 
 import logging
+import re
+from datetime import date
 from typing import Any
 
-import re
-
+from classifier.chart_validator import (
+    CHART_TYPE_BY_REQUIREMENT,
+    derive_requirement,
+    derive_visualization,
+)
 from classifier.llm_client import LLMClient, LLMError
 from classifier.models import (
     BoundaryResult,
@@ -16,24 +21,65 @@ from classifier.models import (
 from classifier.prompts import prompt_manager
 from classifier.stock_resolver import StockResolver
 from classifier.stock_resolver import stock_resolver as default_resolver
-from classifier.chart_validator import (
-    CHART_TYPE_BY_REQUIREMENT,
-    derive_requirement,
-    derive_visualization,
-)
 
 logger = logging.getLogger(__name__)
 
-# A question that anchors a range to a specific calendar year with a month
-# (e.g. "2024年 1~6月") is unambiguously ABSOLUTE. The LLM sometimes still
-# emits a relative range for these; we re-derive the absolute window from the
+# A question that anchors a range to a specific calendar year (e.g. "2024年",
+# "2024年 1~6月") is unambiguously ABSOLUTE. The LLM sometimes still emits a
+# relative range or null for these; we re-derive the absolute window from the
 # raw question text in that case.
-_YEAR_ANCHORED_RE = re.compile(r"\d{4}\s*年[^月]*月")
+_YEAR_ANCHORED_RE = re.compile(r"\d{4}\s*年(?:[^月]*月)?")
+
+# 民國 N 年 (e.g. 民國113年) maps to Gregorian N+1911 (民國113 = 2024). The
+# LLM frequently leaves ``date_range`` null for these; see
+# ``_resolve_question_year_range``.
+_MINGUO_YEAR_RE = re.compile(r"民國\s*(\d{2,3})\s*年")
+
+# A bare 4-digit calendar year immediately followed by supply-chain /
+# annual-report context (e.g. "南亞2024上下游名單", "台塑2024供應商名單")
+# is also an unambiguous ABSOLUTE anchor, even without the "年" suffix.
+# The year is validated in ``_looks_year_anchored`` so a stock code sitting
+# next to such a keyword (e.g. "2330供應商") is not mistaken for a year.
+_BARE_YEAR_CONTEXT_RE = re.compile(r"(\d{4})\s*(?:上下游|供應商|客戶|名單|年報|年度|財報)")
+
+# Calendar years outside this window are never treated as anchors; stock
+# codes (2330, 1303, ...) fall well outside it.
+_BARE_YEAR_MIN = 1990
+_BARE_YEAR_MAX = 2040
 
 
 def _looks_year_anchored(text: str | None) -> bool:
-    """True when the text anchors a range to a specific year + month."""
-    return bool(_YEAR_ANCHORED_RE.search(text or ""))
+    """True when the text anchors a range to a specific calendar year.
+
+    Matches Gregorian (``2024年``, ``2024年 1~6月``), bare year + context
+    (``2024上下游名單``), and ROC-era (``民國113年``) forms.
+    """
+    text = text or ""
+    if _YEAR_ANCHORED_RE.search(text):
+        return True
+    m = _BARE_YEAR_CONTEXT_RE.search(text)
+    if m:
+        year = int(m.group(1))
+        if _BARE_YEAR_MIN <= year <= _BARE_YEAR_MAX:
+            return True
+    return bool(_MINGUO_YEAR_RE.search(text))
+
+
+def _resolve_question_year_range(question: str) -> tuple[date, date] | None:
+    """Resolve a year anchored in the question itself (LLM-agnostic).
+
+    The LLM sometimes leaves ``date_range`` null or relative even when the
+    question names a specific historical year (e.g. "南亞2024年上下游名單",
+    "台塑民國113年度年報揭露的供應商與客戶有哪些"). Derive the absolute window
+    deterministically: ``民國 N 年`` -> Gregorian year N+1911 (full year);
+    otherwise delegate to the general absolute-range parser (Gregorian
+    year/month forms).
+    """
+    m = _MINGUO_YEAR_RE.search(question)
+    if m:
+        year = int(m.group(1)) + 1911
+        return date(year, 1, 1), date(year, 12, 31)
+    return _resolve_absolute_range(question)
 
 
 def _reconcile_chart_fields(question: str, result: BoundaryResult) -> None:
@@ -81,7 +127,6 @@ def _reconcile_chart_fields(question: str, result: BoundaryResult) -> None:
 
 class BoundaryExtractionError(Exception):
     """Boundary extraction errors."""
-
 
 
 def extract_boundary(
@@ -134,23 +179,23 @@ def extract_boundary(
         result.stock_codes = resolved_codes
         result.company_names = company_names
 
-        # Reconcile a flaky relative/absolute misclassification: if the LLM
-        # emitted a RELATIVE range but the question clearly anchors to a
-        # specific calendar year with a month range (e.g. "2024年 1~6月"),
-        # re-derive an ABSOLUTE range from the question text. This mirrors how
-        # the stock resolver corrects name->code mismatches downstream.
-        if (
-            result.date_range is not None
-            and result.date_range.type == TimeScope.RELATIVE
-            and _looks_year_anchored(question)
+        # Reconcile a missing or flaky date range: if the LLM left
+        # ``date_range`` null (common with the /v1 JSON-mode path) or emitted a
+        # RELATIVE range, but the question clearly anchors to a specific
+        # calendar year (e.g. "南亞2024年上下游名單", "台塑民國113年度年報",
+        # "和益 2024年 1~6月趨勢圖"), re-derive an ABSOLUTE range from the
+        # question text. This mirrors how the stock resolver corrects
+        # name->code mismatches downstream.
+        if _looks_year_anchored(question) and (
+            result.date_range is None or result.date_range.type == TimeScope.RELATIVE
         ):
-            resolved = _resolve_absolute_range(question)
+            resolved = _resolve_question_year_range(question)
             if resolved is not None:
                 value = f"{resolved[0].isoformat()}/{resolved[1].isoformat()}"
                 logger.warning(
-                    "Boundary date reconciliation: LLM emitted relative %r but the "
+                    "Boundary date reconciliation: LLM date_range=%r but the "
                     "question anchors to a specific year; re-derived absolute %r",
-                    result.date_range.value,
+                    result.date_range.value if result.date_range else None,
                     value,
                 )
                 result.date_range = DateRange(type=TimeScope.ABSOLUTE, value=value)
