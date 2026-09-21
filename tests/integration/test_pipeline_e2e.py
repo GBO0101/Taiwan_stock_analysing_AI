@@ -10,16 +10,37 @@ Verifies the STRICT sequential execution contract from plan #32.2:
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
+import pytest
+
+from classifier.annual_report import AnnualReportError
 from classifier.llm_client import LLMError
 from classifier.models import (
     BoundaryResult,
     ClassificationResult,
     ClassificationType,
     DecompositionResult,
+    QueryTopicKind,
     SubQuery,
 )
 from classifier.pipeline import Pipeline, PipelineError
 from classifier.stock_enumeration import _RangeValidationModel, _SupplyChainModel
+
+
+@pytest.fixture(autouse=True)
+def _no_annual_report_network():
+    """Keep Step 4 offline: the annual-report path always falls back to the fake LLM.
+
+    Step 4 now tries the target's annual report (doc.twse.com.tw) first, which
+    would hit the real network in tests. Force AnnualReportError so the fake
+    LLM supply-chain model is used instead.
+    """
+    with patch(
+        "classifier.stock_enumeration.extract_annual_report",
+        side_effect=AnnualReportError("no network in tests"),
+    ):
+        yield
 
 
 class FakeLLMClient:
@@ -74,6 +95,10 @@ def test_step1_success_allows_step2():
     assert "ClassificationResult" in fake.calls
     assert result.steps[0].status == "completed"
     assert result.steps[1].status == "completed"
+    # Step 4 completed for the single stock → unified summary is built.
+    assert result.summary is not None
+    assert result.summary.topic_kind == QueryTopicKind.SINGLE_STOCK
+    assert result.summary.topic_code == "2330"
 
 
 def test_step1_failure_blocks_step2():
@@ -98,6 +123,7 @@ def test_non_analytical_skips_step3():
     assert result.steps[2].status == "skipped"
     # Single-stock live query still triggers stock enumeration (supply chain).
     assert result.steps[3].status == "completed"
+    assert result.summary is not None
 
 
 def test_factual_skips_step3():
@@ -110,8 +136,12 @@ def test_factual_skips_step3():
 
 
 def test_non_financial_skips_step3():
+    # A genuinely out-of-domain query resolves no stock/sector scope; with an
+    # empty boundary the NON_FINANCIAL verdict is consistent (not corrected
+    # to factual) and Steps 3-4 must be skipped.
     fake = FakeLLMClient(
-        classification=ClassificationResult(type=ClassificationType.NON_FINANCIAL, confidence=0.9)
+        boundary=BoundaryResult(stock_codes=[], company_names=[], confidence=0.3),
+        classification=ClassificationResult(type=ClassificationType.NON_FINANCIAL, confidence=0.9),
     )
     result = _pipeline_with(fake).run("香蕉好吃嗎")
     assert "DecompositionResult" not in fake.calls
@@ -119,6 +149,8 @@ def test_non_financial_skips_step3():
     # NON_FINANCIAL must skip Step 4 too, regardless of boundary scope.
     assert result.steps[3].step == "stock_enumeration"
     assert result.steps[3].status == "skipped"
+    # Skipped Step 4 → no unified summary.
+    assert result.summary is None
 
 
 def test_analytical_runs_step3():
@@ -131,6 +163,7 @@ def test_analytical_runs_step3():
     # Single stock still triggers Step 4 (supply chain) after decomposition.
     assert result.steps[3].step == "stock_enumeration"
     assert result.steps[3].status == "completed"
+    assert result.summary is not None
 
 
 def test_step2_failure_blocks_step3():

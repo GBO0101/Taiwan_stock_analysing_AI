@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from classifier import api as api_module
+from classifier.annual_report import AnnualReportError
 from classifier.llm_client import LLMError
 from classifier.models import (
     BoundaryResult,
@@ -52,6 +53,21 @@ def _fake_llm(
 
     fake.extract_structured.side_effect = extract
     return fake
+
+
+@pytest.fixture(autouse=True)
+def _no_annual_report_network():
+    """Keep Step 4 offline: the annual-report path always falls back to LLM.
+
+    Step 4 now tries the target's annual report (doc.twse.com.tw) first, which
+    would hit the real network in tests. Force AnnualReportError so the fake
+    LLM's _SupplyChainModel is used instead.
+    """
+    with patch(
+        "classifier.stock_enumeration.extract_annual_report",
+        side_effect=AnnualReportError("no network in tests"),
+    ):
+        yield
 
 
 @pytest.fixture
