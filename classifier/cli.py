@@ -18,7 +18,7 @@ import sys
 from typing import Any
 
 from classifier.chart_renderer import ChartRenderer, ChartRenderError
-from classifier.classification import ClassificationError
+from classifier.logging_setup import setup_logging
 from classifier.models import (
     ChartDataRequirement,
     ChartRequest,
@@ -187,7 +187,9 @@ def _run_chat(render_charts: bool) -> int:
                 continue
             print(json.dumps(output, ensure_ascii=False, indent=2))
             # Update context from the latest boundary for subsequent turns.
-            result = PipelineResult(**{k: v for k, v in output.items() if k in {"question", "steps"}})
+            result = PipelineResult(
+                **{k: v for k, v in output.items() if k in {"question", "steps"}}
+            )
             context = _update_context(context, result)
     except PipelineError as e:
         print(json.dumps({"error": str(e)}, ensure_ascii=False), file=sys.stderr)
@@ -196,6 +198,7 @@ def _run_chat(render_charts: bool) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    setup_logging()
     parser = argparse.ArgumentParser(
         prog="classifier.cli",
         description="Taiwan-stock query understanding, classification, and visualization CLI.",

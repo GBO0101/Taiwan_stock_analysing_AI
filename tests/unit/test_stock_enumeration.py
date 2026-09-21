@@ -255,6 +255,40 @@ class TestStockEnumeration:
         assert all(e.disclosed_by == "llm_inferred" for e in result.evidence)
         assert all(e.target_ratio is None for e in result.evidence)
 
+    def test_related_filters_code_name_mismatch(self):
+        # 止血：LLM 把 2454（實為聯發科）配上「大立光」→ verify_code 回報
+        # name_matches=False → 在 _validate_stocks 被剔除。垃圾提名絕不會觸發
+        # 第二次年報抓取（extract_annual_report 只為目標公司自身呼叫，沒有
+        # 任何一次呼叫針對 2454）。
+        llm = Mock()
+        llm.extract_structured.return_value = _supply_chain(
+            upstream=(("2454", "大立光", 0.5),),
+            confidence=0.4,
+        )
+        resolver = Mock()
+        resolver.verify_code.side_effect = [
+            _verify("台積電"),
+            {
+                "exists": True,
+                "name": "聯發科",
+                "name_matches": False,
+                "market": "TWSE",
+            },
+        ]
+        runner = self._runner(llm_client=llm, resolver=resolver)
+
+        with patch(
+            "classifier.stock_enumeration.extract_annual_report",
+            side_effect=AnnualReportError("no report"),
+        ) as mock_extract:
+            result = runner.related_stock("2330")
+
+        assert result.source == "llm"
+        assert [s.code for s in result.upstream] == []
+        # 止血核心：碼名錯配的提名被剔除後，不曾為 2454 抓年報。
+        assert all(call.args[0] != "2454" for call in mock_extract.call_args_list)
+        assert mock_extract.call_count == 1  # 僅目標公司自身之年報嘗試
+
     def test_related_raises_on_llm_error(self):
         llm = Mock()
         llm.extract_structured.side_effect = LLMError("llm down")
@@ -270,6 +304,171 @@ class TestStockEnumeration:
             pytest.raises(StockEnumerationError),
         ):
             runner.related_stock("2330")
+
+    # ------------------------------------------------------------------
+    # Related mode — LLM fallback + two-sided annual-report verification
+    # ------------------------------------------------------------------
+    def test_related_llm_verify_promotes_matching_links(self):
+        # Tier 2: 目標年報無法取得 → LLM 提名 3008(上游, impact 0.7) 與
+        # 2317(下游, impact 0.7)。被提名公司的年報雙向揭露目標、比例落在
+        # LLM impact 帶（0.6-0.8 → 5-20%，容差後 3-22%）→ 升級為 counterparty。
+        llm = Mock()
+        llm.extract_structured.return_value = _supply_chain(
+            upstream=(("3008", "大立光", 0.7),),
+            downstream=(("2317", "鴻海", 0.7),),
+            confidence=0.4,
+        )
+        resolver = Mock()
+        resolver.verify_code.side_effect = [
+            _verify("台積電"),
+            _verify("大立光"),
+            _verify("鴻海"),
+        ]
+        runner = self._runner(llm_client=llm, resolver=resolver)
+
+        # 3008 是台積電的上游供應商 → 台積電是 3008 的客戶（customers）。
+        d3008 = AnnualReportDisclosure(
+            target_code="3008",
+            target_name="大立光",
+            fiscal_year=113,
+            report_type="F18",
+            pdf_name="3008_113.pdf",
+            pdf_url="x",
+            customers=[
+                CounterpartyDisclosure(
+                    raw_name="台積電", resolved_code="2330", resolved_name="台積電", ratio=10.0
+                ),
+            ],
+            confidence=0.8,
+        )
+        # 2317 是台積電的下游客戶 → 台積電是 2317 的供應商（suppliers）。
+        d2317 = AnnualReportDisclosure(
+            target_code="2317",
+            target_name="鴻海",
+            fiscal_year=113,
+            report_type="F18",
+            pdf_name="2317_113.pdf",
+            pdf_url="x",
+            suppliers=[
+                CounterpartyDisclosure(
+                    raw_name="台積電", resolved_code="2330", resolved_name="台積電", ratio=15.0
+                ),
+            ],
+            confidence=0.8,
+        )
+        with patch(
+            "classifier.stock_enumeration.extract_annual_report",
+            side_effect=[AnnualReportError("no report"), d3008, d2317],
+        ):
+            result = runner.related_stock("2330")
+
+        assert result.source == "llm"
+        # 雙向揭露且比例一致 → 升級為 counterparty，帶真實比例/來源/年度。
+        ev_3008 = next(e for e in result.evidence if e.counterparty_code == "3008")
+        assert ev_3008.relation == SupplyChainRelation.UPSTREAM
+        assert ev_3008.disclosed_by == "counterparty"
+        assert ev_3008.target_ratio == pytest.approx(10.0)
+        assert ev_3008.source_pdf == "3008_113.pdf"
+        assert ev_3008.fiscal_year == 113
+
+        ev_2317 = next(e for e in result.evidence if e.counterparty_code == "2317")
+        assert ev_2317.relation == SupplyChainRelation.DOWNSTREAM
+        assert ev_2317.disclosed_by == "counterparty"
+        assert ev_2317.target_ratio == pytest.approx(15.0)
+        assert ev_2317.source_pdf == "2317_113.pdf"
+        assert ev_2317.fiscal_year == 113
+
+        # impact_map 改用真實比例（10/100, 15/100）；confidence 小幅提升。
+        assert runner._last_meta["impact_map"][
+            ("3008", SupplyChainRelation.UPSTREAM)
+        ] == pytest.approx(10.0 / 100)
+        assert runner._last_meta["impact_map"][
+            ("2317", SupplyChainRelation.DOWNSTREAM)
+        ] == pytest.approx(15.0 / 100)
+        assert result.confidence == pytest.approx(0.5)
+        assert "雙向揭露證實" in " ".join(runner._last_meta["notes"])
+
+    def test_related_llm_verify_keeps_inferred_on_ratio_mismatch(self):
+        # 被提名公司年報揭露目標，但比例（40.0%）超出 impact 0.7 帶
+        # （5-20%，容差後上限 22%）→ 維持 llm_inferred。
+        llm = Mock()
+        llm.extract_structured.return_value = _supply_chain(
+            upstream=(("3008", "大立光", 0.7),),
+            confidence=0.4,
+        )
+        resolver = Mock()
+        resolver.verify_code.side_effect = [
+            _verify("台積電"),
+            _verify("大立光"),
+        ]
+        runner = self._runner(llm_client=llm, resolver=resolver)
+
+        d3008 = AnnualReportDisclosure(
+            target_code="3008",
+            target_name="大立光",
+            fiscal_year=113,
+            report_type="F18",
+            pdf_name="3008_113.pdf",
+            pdf_url="x",
+            customers=[
+                CounterpartyDisclosure(
+                    raw_name="台積電", resolved_code="2330", resolved_name="台積電", ratio=40.0
+                ),
+            ],
+            confidence=0.8,
+        )
+        with patch(
+            "classifier.stock_enumeration.extract_annual_report",
+            side_effect=[AnnualReportError("no report"), d3008],
+        ):
+            result = runner.related_stock("2330")
+
+        ev_3008 = next(e for e in result.evidence if e.counterparty_code == "3008")
+        assert ev_3008.disclosed_by == "llm_inferred"
+        assert ev_3008.target_ratio is None
+        assert ev_3008.source_pdf is None
+        assert result.confidence == pytest.approx(0.4)
+        assert "雙向揭露證實" not in " ".join(runner._last_meta["notes"])
+
+    def test_related_llm_verify_keeps_inferred_on_direction_mismatch(self):
+        # 被提名公司年報有揭露目標，但方向與推測相反（3008 被提名為上游供應
+        # 商應將目標列為客戶，這裡卻列為供應商）→ 維持 llm_inferred。
+        llm = Mock()
+        llm.extract_structured.return_value = _supply_chain(
+            upstream=(("3008", "大立光", 0.7),),
+            confidence=0.4,
+        )
+        resolver = Mock()
+        resolver.verify_code.side_effect = [
+            _verify("台積電"),
+            _verify("大立光"),
+        ]
+        runner = self._runner(llm_client=llm, resolver=resolver)
+
+        d3008 = AnnualReportDisclosure(
+            target_code="3008",
+            target_name="大立光",
+            fiscal_year=113,
+            report_type="F18",
+            pdf_name="3008_113.pdf",
+            pdf_url="x",
+            suppliers=[
+                CounterpartyDisclosure(
+                    raw_name="台積電", resolved_code="2330", resolved_name="台積電", ratio=10.0
+                ),
+            ],
+            confidence=0.8,
+        )
+        with patch(
+            "classifier.stock_enumeration.extract_annual_report",
+            side_effect=[AnnualReportError("no report"), d3008],
+        ):
+            result = runner.related_stock("2330")
+
+        ev_3008 = next(e for e in result.evidence if e.counterparty_code == "3008")
+        assert ev_3008.disclosed_by == "llm_inferred"
+        assert ev_3008.target_ratio is None
+        assert result.confidence == pytest.approx(0.4)
 
     # ------------------------------------------------------------------
     # Related mode — annual report first

@@ -3,6 +3,7 @@
 Starts the FastAPI backend (port 8000) and the frontend static server
 (port 8080) together, then opens the browser. Ctrl-C stops both.
 """
+
 from __future__ import annotations
 
 import subprocess
@@ -10,6 +11,8 @@ import sys
 import time
 import webbrowser
 from pathlib import Path
+
+from classifier.logging_setup import setup_logging
 
 ROOT = Path(__file__).resolve().parent
 FRONTEND_DIR = ROOT / "frontend"
@@ -30,6 +33,7 @@ def _popen(args: list[str]) -> subprocess.Popen:
 
 
 def main() -> int:
+    setup_logging()
     api = _popen([sys.executable, "-m", "classifier.api"])
     static = _popen(
         [
@@ -51,7 +55,7 @@ def main() -> int:
     time.sleep(3)
     try:
         webbrowser.open(f"http://{API_HOST}:{FRONTEND_PORT}")
-    except Exception:
+    except Exception:  # noqa: BLE001 - headless box: never crash on browser open
         # Headless / no default browser: just print the URL instead of crashing.
         print(f"請手動開啟：http://{API_HOST}:{FRONTEND_PORT}")
 

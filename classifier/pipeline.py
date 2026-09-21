@@ -1,5 +1,7 @@
 """Pipeline runner: orchestrates Steps 1-4 in strict sequential order."""
 
+import logging
+import time
 from typing import Any
 
 from classifier.boundary import BoundaryExtractionError, extract_boundary
@@ -18,10 +20,11 @@ from classifier.models import (
 )
 from classifier.stock_enumeration import StockEnumeration, StockEnumerationError
 
+logger = logging.getLogger(__name__)
+
 
 class PipelineError(Exception):
     """Pipeline execution errors."""
-
 
 
 class Pipeline:
@@ -69,48 +72,81 @@ class Pipeline:
             PipelineError: If any step fails
         """
         steps: list[PipelineStepResult] = []
+        t_start = time.monotonic()
 
         # Step 1: Boundary Extraction
+        t0 = time.monotonic()
         try:
             boundary = extract_boundary(
                 question=question,
                 context=context,
                 llm_client=self.llm_client,
             )
-            steps.append(PipelineStepResult(
-                step="boundary",
-                status=StepStatus.COMPLETED,
-                output=boundary.model_dump(),
-            ))
+            steps.append(
+                PipelineStepResult(
+                    step="boundary",
+                    status=StepStatus.COMPLETED,
+                    output=boundary.model_dump(),
+                )
+            )
+            logger.info(
+                "Step 1 (boundary) OK in %.2fs: %d stock code(s), %d sector(s)",
+                time.monotonic() - t0,
+                len(boundary.stock_codes),
+                len(boundary.sectors),
+            )
         except BoundaryExtractionError as e:
-            steps.append(PipelineStepResult(
-                step="boundary",
-                status=StepStatus.FAILED,
-                output={"error": str(e)},
-            ))
+            steps.append(
+                PipelineStepResult(
+                    step="boundary",
+                    status=StepStatus.FAILED,
+                    output={"error": str(e)},
+                )
+            )
+            logger.error(
+                "Step 1 (boundary) FAILED in %.2fs: %s",
+                time.monotonic() - t0,
+                e,
+            )
             raise PipelineError(f"Step 1 (Boundary) failed: {e}") from e
 
         # Step 2: Classification
+        t0 = time.monotonic()
         try:
             classification = classify_query(
                 question=question,
                 boundary=boundary,
                 llm_client=self.llm_client,
             )
-            steps.append(PipelineStepResult(
-                step="classification",
-                status=StepStatus.COMPLETED,
-                output=classification.model_dump(),
-            ))
+            steps.append(
+                PipelineStepResult(
+                    step="classification",
+                    status=StepStatus.COMPLETED,
+                    output=classification.model_dump(),
+                )
+            )
+            logger.info(
+                "Step 2 (classification) OK in %.2fs: type=%s",
+                time.monotonic() - t0,
+                classification.type.value,
+            )
         except ClassificationError as e:
-            steps.append(PipelineStepResult(
-                step="classification",
-                status=StepStatus.FAILED,
-                output={"error": str(e)},
-            ))
+            steps.append(
+                PipelineStepResult(
+                    step="classification",
+                    status=StepStatus.FAILED,
+                    output={"error": str(e)},
+                )
+            )
+            logger.error(
+                "Step 2 (classification) FAILED in %.2fs: %s",
+                time.monotonic() - t0,
+                e,
+            )
             raise PipelineError(f"Step 2 (Classification) failed: {e}") from e
 
         # Step 3: Decomposition (conditional - only for analytical queries)
+        t0 = time.monotonic()
         if classification.type == ClassificationType.ANALYTICAL:
             try:
                 decomposition = decompose_query(
@@ -120,59 +156,93 @@ class Pipeline:
                     llm_client=self.llm_client,
                     indicator_mapper=self.indicator_mapper,
                 )
-                steps.append(PipelineStepResult(
-                    step="decomposition",
-                    status=StepStatus.COMPLETED,
-                    output=decomposition.model_dump(),
-                ))
+                steps.append(
+                    PipelineStepResult(
+                        step="decomposition",
+                        status=StepStatus.COMPLETED,
+                        output=decomposition.model_dump(),
+                    )
+                )
+                logger.info(
+                    "Step 3 (decomposition) OK in %.2fs",
+                    time.monotonic() - t0,
+                )
             except DecompositionError as e:
-                steps.append(PipelineStepResult(
-                    step="decomposition",
-                    status=StepStatus.FAILED,
-                    output={"error": str(e)},
-                ))
+                steps.append(
+                    PipelineStepResult(
+                        step="decomposition",
+                        status=StepStatus.FAILED,
+                        output={"error": str(e)},
+                    )
+                )
+                logger.error(
+                    "Step 3 (decomposition) FAILED in %.2fs: %s",
+                    time.monotonic() - t0,
+                    e,
+                )
                 raise PipelineError(f"Step 3 (Decomposition) failed: {e}") from e
         else:
-            steps.append(PipelineStepResult(
-                step="decomposition",
-                status=StepStatus.SKIPPED,
-                output={"reason": f"Skipped: classification type is {classification.type}"},
-            ))
+            steps.append(
+                PipelineStepResult(
+                    step="decomposition",
+                    status=StepStatus.SKIPPED,
+                    output={"reason": f"Skipped: classification type is {classification.type}"},
+                )
+            )
 
         # Step 4: Stock Enumeration (conditional)
         summary: QuerySummary | None = None
-        should_enumerate = (
-            classification.type != ClassificationType.NON_FINANCIAL
-            and (
-                len(boundary.stock_codes) > 0
-                or len(boundary.sectors) > 0
-                or boundary.stock_scope in (StockScope.SECTOR, StockScope.MARKET)
-            )
+        should_enumerate = classification.type != ClassificationType.NON_FINANCIAL and (
+            len(boundary.stock_codes) > 0
+            or len(boundary.sectors) > 0
+            or boundary.stock_scope in (StockScope.SECTOR, StockScope.MARKET)
         )
 
+        t0 = time.monotonic()
         if should_enumerate:
             try:
                 enum_result = self.enumeration.run(question=question, boundary=boundary)
                 summary = self.enumeration.build_summary(boundary, enum_result)
-                steps.append(PipelineStepResult(
-                    step="stock_enumeration",
-                    status=StepStatus.COMPLETED,
-                    output=enum_result.model_dump(),
-                ))
+                steps.append(
+                    PipelineStepResult(
+                        step="stock_enumeration",
+                        status=StepStatus.COMPLETED,
+                        output=enum_result.model_dump(),
+                    )
+                )
+                logger.info(
+                    "Step 4 (stock_enumeration) OK in %.2fs: source=%s",
+                    time.monotonic() - t0,
+                    getattr(enum_result, "source", "n/a"),
+                )
             except StockEnumerationError as e:
-                steps.append(PipelineStepResult(
-                    step="stock_enumeration",
-                    status=StepStatus.FAILED,
-                    output={"error": str(e)},
-                ))
+                steps.append(
+                    PipelineStepResult(
+                        step="stock_enumeration",
+                        status=StepStatus.FAILED,
+                        output={"error": str(e)},
+                    )
+                )
+                logger.error(
+                    "Step 4 (stock_enumeration) FAILED in %.2fs: %s",
+                    time.monotonic() - t0,
+                    e,
+                )
                 raise PipelineError(f"Step 4 (Stock Enumeration) failed: {e}") from e
         else:
-            steps.append(PipelineStepResult(
-                step="stock_enumeration",
-                status=StepStatus.SKIPPED,
-                output={"reason": "Skipped: no scope/stock codes or non-financial query"},
-            ))
+            steps.append(
+                PipelineStepResult(
+                    step="stock_enumeration",
+                    status=StepStatus.SKIPPED,
+                    output={"reason": "Skipped: no scope/stock codes or non-financial query"},
+                )
+            )
 
+        logger.info(
+            "Pipeline finished in %.2fs: %s",
+            time.monotonic() - t_start,
+            ", ".join(f"{s.step}={s.status.value}" for s in steps),
+        )
         return PipelineResult(
             question=question,
             steps=steps,

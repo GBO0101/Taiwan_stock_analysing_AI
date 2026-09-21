@@ -4,13 +4,21 @@ Executes after Step 3 and produces either:
 - RangeStockResult: all stocks matching a sector/index/market, or
 - RelatedStockResult: upstream/downstream of a single stock.
 
-Related mode is annual-report-first: when the target's annual report
-(股東會年報 from doc.twse.com.tw) discloses top customers/suppliers, those
-resolved counterparties are used with their real revenue/purchase ratios.
-The counterparties' own annual reports are then cross-checked (Phase 1.5)
-so two-sided disclosures are marked ``disclosed_by="both"``. LLM inference
-is a fallback when the annual report is unavailable or yields nothing
-resolvable.
+Related mode is annual-report-first with a three-tier priority:
+
+1. **Annual report** (股東會年報 from doc.twse.com.tw): the target's report
+   discloses top customers/suppliers with real revenue/purchase ratios used
+   directly (``disclosed_by="target"``); counterparties' own annual reports
+   are cross-checked (Phase 1.5) so two-sided links become ``"both"``.
+2. **LLM inference + two-sided verification**: when the target's annual
+   report is unavailable or yields nothing resolvable, the LLM nominates
+   upstream/downstream companies (supply_chain.j2). Each nominee's own
+   annual report is then checked: if it discloses the target in the matching
+   direction and the disclosed ratio is consistent with the LLM's impact
+   band, the link is promoted to ``disclosed_by="counterparty"`` with the
+   real ratio (trusted, not ``llm_inferred``).
+3. **Unverified LLM inference**: nominees whose own report cannot confirm
+   the link stay ``disclosed_by="llm_inferred"`` (lowest priority).
 
 Trigger (checked in the pipeline): boundary has stock codes OR a range/topic,
 AND classification type is not NON_FINANCIAL.
@@ -19,6 +27,7 @@ AND classification type is not NON_FINANCIAL.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -294,9 +303,15 @@ class StockEnumeration:
     ) -> RelatedStockResult:
         """Resolve upstream/downstream of a single stock, annual-report-first.
 
-        Flow: annual report → resolved counterparties. If the report is missing,
-        unreadable, or yields no resolvable listed counterparties, fall back to
-        LLM inference (supply_chain.j2).
+        Three-tier priority:
+        1. Annual report → resolved counterparties (``disclosed_by="target"``,
+           two-sided links become ``"both"`` via Phase 1.5 cross-validation).
+        2. LLM inference (supply_chain.j2) + two-sided verification: each
+           LLM nominee's own annual report is fetched and, if it discloses
+           the target in the matching direction with a ratio consistent with
+           the LLM's impact band, the link is promoted to
+           ``disclosed_by="counterparty"`` with the real ratio.
+        3. Unverified LLM nominees stay ``disclosed_by="llm_inferred"``.
         """
         info = self.resolver.verify_code(stock_code)
         stock_name = info["name"] or stock_code
@@ -420,6 +435,12 @@ class StockEnumeration:
                 raise StockEnumerationError(f"Supply-chain inference failed: {e}") from e
 
             confidence = result.confidence
+            logger.info(
+                "LLM supply-chain nomination: %d upstream, %d downstream, confidence=%.2f",
+                len(result.upstream),
+                len(result.downstream),
+                result.confidence,
+            )
             notes.append("資料來源：LLM 推論（年報無可用揭露）")
             for entry in result.upstream:
                 upstream.append(StockItem(code=entry.code, name=entry.name))
@@ -452,6 +473,25 @@ class StockEnumeration:
 
         upstream = self._validate_stocks(upstream)
         downstream = self._validate_stocks(downstream)
+
+        # Phase 2.0 (tier 2 of the three-tier priority): when NLP fallback was
+        # used, verify each LLM-nominated counterparty against its own annual
+        # report. A nominee whose report discloses the target in the matching
+        # direction with a ratio consistent with the LLM's impact band is
+        # promoted from llm_inferred to counterparty (trusted, real ratio).
+        if source == "llm" and fiscal_years:
+            verified = self._verify_llm_links(
+                evidence,
+                impact_map,
+                {s.code for s in upstream} | {s.code for s in downstream},
+                stock_code,
+                fiscal_years[-1],
+            )
+            if verified:
+                notes.append(
+                    f"其中 {verified} 筆連結經對方(被提名公司)年報雙向揭露證實，比例與推測一致"
+                )
+                confidence = min(1.0, confidence + 0.1)
 
         self._last_meta = {
             "kind": "related",
@@ -517,13 +557,167 @@ class StockEnumeration:
         if checked:
             logger.info("Cross-validated %d counterparty annual reports", checked)
 
+    @staticmethod
+    def _impact_matches_ratio(impact: float, ratio: float) -> bool:
+        """Check an annual-report ratio (%) matches the LLM impact band.
+
+        Bands from prompts/supply_chain.j2: 0.9+ → >20%, 0.6-0.8 → 5-20%,
+        0.3-0.5 → 1-5%, <0.3 → <1%. Each boundary is relaxed by a 2-percentage-
+        point tolerance so a borderline ratio still counts as a match.
+        """
+        tolerance = 2.0
+        if impact >= 0.9:
+            return ratio > 20.0 - tolerance
+        if impact >= 0.6:
+            return 5.0 - tolerance <= ratio <= 20.0 + tolerance
+        if impact >= 0.3:
+            return max(1.0 - tolerance, 0.0) <= ratio <= 5.0 + tolerance
+        return ratio < 1.0 + tolerance
+
+    def _verify_llm_links(
+        self,
+        evidence: list[SupplyChainEvidence],
+        impact_map: dict[tuple[str, SupplyChainRelation], float],
+        valid_codes: set[str],
+        target_code: str,
+        fiscal_year: int,
+    ) -> int:
+        """Phase 2.0: verify LLM-inferred links via nominees' annual reports.
+
+        Fetches each LLM-nominated counterparty's own annual report (up to
+        ``_MAX_CROSS_VALIDATE``, ordered by the LLM's impact desc) and, when it
+        discloses the target in a direction consistent with the inferred link —
+        an UPSTREAM nominee must list the target as its CUSTOMER, a DOWNSTREAM
+        nominee as its SUPPLIER — with a ratio matching the LLM's impact band,
+        promotes the evidence from ``llm_inferred`` to ``counterparty`` with
+        the real ratio/source PDF/fiscal year. Returns the number of links
+        promoted.
+        """
+        unique: dict[tuple[str, SupplyChainRelation], SupplyChainEvidence] = {}
+        for ev in evidence:
+            if ev.disclosed_by != "llm_inferred":
+                continue
+            if ev.counterparty_code not in valid_codes:
+                continue
+            unique.setdefault((ev.counterparty_code, ev.relation), ev)
+
+        candidates = sorted(
+            unique.values(),
+            key=lambda e: impact_map.get((e.counterparty_code, e.relation), 0.0),
+            reverse=True,
+        )
+
+        if candidates:
+            logger.info(
+                "LLM fallback verification: %d unique nominee(s), "
+                "cross-checking up to %d through annual reports",
+                len(candidates),
+                min(len(candidates), _MAX_CROSS_VALIDATE),
+            )
+
+        promoted = 0
+        for ev in candidates[:_MAX_CROSS_VALIDATE]:
+            t0 = time.monotonic()
+            logger.info(
+                "Fetching nominee %s(%s) annual report (fiscal %d) to verify %s link",
+                ev.counterparty_code,
+                ev.counterparty_name,
+                fiscal_year,
+                ev.relation.value,
+            )
+            try:
+                cdisc = extract_annual_report(
+                    ev.counterparty_code,
+                    ev.counterparty_name,
+                    fiscal_year,
+                    llm_client=self.llm_client,
+                    resolver=self.resolver,
+                )
+            except AnnualReportError as e:
+                logger.info(
+                    "Nominee %s annual report unavailable after %.1fs: %s",
+                    ev.counterparty_code,
+                    time.monotonic() - t0,
+                    e,
+                )
+                continue
+            if cdisc is None:
+                logger.info(
+                    "Nominee %s annual report empty after %.1fs",
+                    ev.counterparty_code,
+                    time.monotonic() - t0,
+                )
+                continue
+            # Direction-aware: the nominee's own report must list the target in
+            # the mirror direction of the inferred link.
+            if ev.relation == SupplyChainRelation.UPSTREAM:
+                matches = [c for c in cdisc.customers if c.resolved_code == target_code]
+            else:
+                matches = [s for s in cdisc.suppliers if s.resolved_code == target_code]
+            if not matches:
+                logger.info(
+                    "Nominee %s does not list target %s in the mirrored direction after %.1fs",
+                    ev.counterparty_code,
+                    target_code,
+                    time.monotonic() - t0,
+                )
+                continue
+            real_ratio = matches[0].ratio
+            if real_ratio is None or not self._impact_matches_ratio(
+                impact_map.get((ev.counterparty_code, ev.relation), 0.0),
+                real_ratio,
+            ):
+                logger.info(
+                    "Nominee %s discloses target at ratio=%s which does not match "
+                    "the inferred impact band after %.1fs",
+                    ev.counterparty_code,
+                    real_ratio,
+                    time.monotonic() - t0,
+                )
+                continue
+
+            ev.disclosed_by = "counterparty"
+            ev.target_ratio = real_ratio
+            ev.source_pdf = cdisc.pdf_name
+            ev.fiscal_year = cdisc.fiscal_year
+            impact_map[(ev.counterparty_code, ev.relation)] = real_ratio / 100.0
+            logger.info(
+                "Two-sided LLM link verified: %s (%s, ratio=%.1f%%)",
+                ev.counterparty_code,
+                ev.relation.value,
+                real_ratio,
+            )
+            promoted += 1
+
+        if promoted:
+            logger.info(
+                "Promoted %d LLM-inferred link(s) from annual-report verification",
+                promoted,
+            )
+        return promoted
+
     def _validate_stocks(self, stocks: list[StockItem]) -> list[StockItem]:
-        """Drop stocks whose code doesn't resolve to the given name."""
+        """Drop stocks whose code can't be verified against the claimed name.
+
+        Verification is code+name aware (``name_matches is not False``): a
+        nominee whose claimed name does not match the code's real company
+        (e.g. the LLM pairs 2454 with "大立光") is garbage and gets dropped
+        here, before Phase 2.0, so no annual report is ever fetched for it —
+        the 止血 against bad LLM fallback nominations.
+        """
         valid: list[StockItem] = []
         for s in stocks:
-            info = self.resolver.verify_code(s.code)
-            if info["exists"] and (info["name"] or s.name):
+            info = self.resolver.verify_code(s.code, s.name)
+            if info["exists"] and info["name_matches"] is not False and (info["name"] or s.name):
                 valid.append(s)
+                continue
+            logger.info(
+                "Dropping nominee %s(%s): exists=%s name_matches=%s",
+                s.code,
+                s.name,
+                info["exists"],
+                info["name_matches"],
+            )
         return valid
 
     # ------------------------------------------------------------------

@@ -11,6 +11,9 @@ __pycache__/
 # Generated chart output
 output/
 
+# Application logs (classifier/logging_setup.py)
+logs/
+
 # Runtime TTL cache (doc.twse / annual-report extraction snapshots)
 classifier/cache/
 

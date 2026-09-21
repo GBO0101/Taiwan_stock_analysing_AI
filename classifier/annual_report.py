@@ -12,6 +12,7 @@ from __future__ import annotations
 import io
 import logging
 import re
+import time
 
 from classifier.doc_twse_client import DocTwseClient, DocTwseClientError
 from classifier.doc_twse_client import doc_twse_client as default_doc_client
@@ -614,6 +615,13 @@ def extract_annual_report(
             logger.warning("Cached annual-report disclosure invalid, re-extracting: %s", e)
 
     last_error: str = ""
+    t0 = time.monotonic()
+    logger.info(
+        "Extracting annual report for %s (%s) fiscal %d",
+        stock_code,
+        stock_name,
+        fiscal_year,
+    )
 
     for year_offset in range(_MAX_FALLBACK_YEARS + 1):
         try_year = fiscal_year - year_offset
@@ -697,6 +705,17 @@ def extract_annual_report(
             except CacheError as e:
                 logger.warning("Annual-report cache write failed: %s", e)
 
+            logger.info(
+                "Annual report %s (%s) fiscal %d (%s) extracted in %.1fs: "
+                "%d customers, %d suppliers",
+                stock_code,
+                stock_name,
+                try_year,
+                label,
+                time.monotonic() - t0,
+                len(customers),
+                len(suppliers),
+            )
             return result
 
     raise AnnualReportError(

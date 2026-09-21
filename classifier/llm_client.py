@@ -6,7 +6,9 @@ OpenRouter, LM Studio, ...) works by pointing ``LLM_BASE_URL`` at it.
 """
 
 import json
-from typing import Type, TypeVar
+import logging
+import time
+from typing import TypeVar
 
 import requests
 from openai import OpenAI
@@ -15,37 +17,29 @@ from pydantic import BaseModel, ValidationError
 
 from classifier.config import settings
 
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T", bound=BaseModel)
 
 
 class LLMError(Exception):
     """Base exception for LLM errors."""
 
-    pass
-
 
 class LLMNetworkError(LLMError):
     """Network-related errors."""
-
-    pass
 
 
 class LLMTimeoutError(LLMError):
     """Request timeout errors."""
 
-    pass
-
 
 class LLMAuthError(LLMError):
     """Authentication errors."""
 
-    pass
-
 
 class LLMOutputError(LLMError):
     """Malformed or invalid output errors."""
-
-    pass
 
 
 class LLMClient:
@@ -78,7 +72,7 @@ class LLMClient:
         )
 
     @staticmethod
-    def _schema_hint(response_model: Type[BaseModel]) -> str:
+    def _schema_hint(response_model: type[BaseModel]) -> str:
         """Build a compact JSON-schema hint for the response model."""
         schema = response_model.model_json_schema()
         hint = {
@@ -113,6 +107,7 @@ class LLMClient:
         """
         base_url = self.base_url.rstrip("/").removesuffix("/v1")
         chat_url = f"{base_url}/api/chat"
+        t0 = time.monotonic()
 
         try:
             resp = requests.post(
@@ -147,12 +142,19 @@ class LLMClient:
             raise LLMNetworkError(f"LLM error ({error_type}): {error_msg}") from e
 
         payload = resp.json()
-        return payload.get("message", {}).get("content", "") or ""
+        content = payload.get("message", {}).get("content", "") or ""
+        logger.info(
+            "LLM native chat OK: %.1fs, num_ctx=%d, out=%d chars",
+            time.monotonic() - t0,
+            num_ctx,
+            len(content),
+        )
+        return content
 
     def extract_structured(
         self,
         prompt: str,
-        response_model: Type[T],
+        response_model: type[T],
         num_ctx: int | None = None,
     ) -> T:
         """Extract structured output from an OpenAI-compatible LLM.
@@ -189,6 +191,7 @@ class LLMClient:
             "markdown code fences, or content outside the JSON object.\n\n"
             f"Schema:\n{self._schema_hint(response_model)}"
         )
+        t0 = time.monotonic()
         try:
             if num_ctx is not None:
                 content = self._native_chat(system_prompt, prompt, num_ctx)
@@ -210,10 +213,26 @@ class LLMClient:
             except json.JSONDecodeError as e:
                 raise LLMOutputError(f"Failed to parse JSON output: {e}") from e
             try:
-                return response_model.model_validate(data)
+                validated = response_model.model_validate(data)
             except ValidationError as e:
                 raise LLMOutputError(f"Output validation failed: {e}") from e
-        except LLMError:
+            logger.info(
+                "LLM %s OK: %.1fs, num_ctx=%s, in=%d chars, out=%d chars, model=%s",
+                response_model.__name__,
+                time.monotonic() - t0,
+                num_ctx,
+                len(prompt),
+                len(content),
+                self.model,
+            )
+            return validated
+        except LLMError as e:
+            logger.warning(
+                "LLM %s FAILED after %.1fs: %s",
+                response_model.__name__,
+                time.monotonic() - t0,
+                e,
+            )
             raise
         except Exception as e:
             error_msg = str(e)

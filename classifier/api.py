@@ -80,4 +80,7 @@ def health_endpoint() -> dict:
 if __name__ == "__main__":
     import uvicorn
 
+    from classifier.logging_setup import setup_logging
+
+    setup_logging()
     uvicorn.run(app, host="127.0.0.1", port=8000)
