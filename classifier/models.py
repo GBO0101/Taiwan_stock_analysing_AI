@@ -1,9 +1,10 @@
 """Pydantic models for the classify-twse-query pipeline contracts."""
 
-from datetime import date, datetime, timedelta
 import re
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -84,6 +85,9 @@ class Market(str, Enum):
     TPEx = "TPEx"
 
 
+_TW_OFFSET = timezone(timedelta(hours=8))
+
+
 def _parse_date_flex(raw: str) -> date | None:
     """Parse a date string accepting Western and Chinese, day/month/year precision."""
     raw = raw.strip()
@@ -100,7 +104,8 @@ def _parse_date_flex(raw: str) -> date | None:
     # Western forms: 2024-01-01 / 2024-01 / 2024 / 2024/01/01 / 2024/01
     for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m", "%Y/%m", "%Y"):
         try:
-            return datetime.strptime(raw, fmt).date()
+            # Attach UTC tz so DTZ007 passes; `.date()` keeps the same date.
+            return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc).date()
         except ValueError:
             continue
     return None
@@ -220,8 +225,8 @@ class DateRange(BaseModel):
         try:
             if self.type == TimeScope.ABSOLUTE:
                 return _resolve_absolute_range(self.value)
-            # Relative: counted back from today.
-            end = date.today()
+            # Relative: counted back from today (Taiwan time, DTZ011).
+            end = datetime.now(_TW_OFFSET).date()
             match = re.match(r"\s*(\d+)\s*([dwmy])\s*$", self.value.lower())
             if not match:
                 return None
@@ -246,14 +251,14 @@ class BoundaryResult(BaseModel):
     stock_codes: list[str] = Field(default_factory=list, description="Stock codes (e.g., ['2330'])")
     company_names: list[str] = Field(default_factory=list, description="Company names (e.g., ['台積電'])")
     sectors: list[str] = Field(default_factory=list, description="Sector names")
-    date_range: Optional[DateRange] = Field(default=None, description="Date range specification")
-    time_scope: Optional[TimeScope] = Field(default=None, description="Time scope type")
-    stock_scope: Optional[StockScope] = Field(default=None, description="Stock scope type")
-    data_dimension: Optional[DataDimension] = Field(default=None, description="Data dimension")
+    date_range: DateRange | None = Field(default=None, description="Date range specification")
+    time_scope: TimeScope | None = Field(default=None, description="Time scope type")
+    stock_scope: StockScope | None = Field(default=None, description="Stock scope type")
+    data_dimension: DataDimension | None = Field(default=None, description="Data dimension")
     market: Market = Field(default=Market.TWSE, description="Market")
     metrics: list[str] = Field(default_factory=list, description="Requested metrics")
-    chart_type: Optional[ChartType] = Field(default=None, description="Chart type hint from query")
-    chart_data_requirements: Optional[ChartDataRequirement] = Field(
+    chart_type: ChartType | None = Field(default=None, description="Chart type hint from query")
+    chart_data_requirements: ChartDataRequirement | None = Field(
         default=None,
         description="Validated chart data requirement; single source of truth for charting",
     )
@@ -266,10 +271,10 @@ class ClassificationResult(BaseModel):
     type: ClassificationType = Field(..., description="Query classification")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Classification confidence")
     needs_clarification: bool = Field(default=False, description="Whether clarification is needed")
-    clarification_question: Optional[str] = Field(default=None, description="Clarification question if needed")
+    clarification_question: str | None = Field(default=None, description="Clarification question if needed")
     needs_visualization: bool = Field(default=False, description="Whether visualization is requested")
-    chart_type: Optional[ChartType] = Field(default=None, description="Chart type for visualization")
-    chart_data_requirements: Optional[ChartDataRequirement] = Field(
+    chart_type: ChartType | None = Field(default=None, description="Chart type for visualization")
+    chart_data_requirements: ChartDataRequirement | None = Field(
         default=None, description="Chart data requirement type"
     )
     target_datasets: list[str] = Field(default_factory=list, description="Target FinMind datasets")
@@ -281,8 +286,8 @@ class SubQuery(BaseModel):
     id: str = Field(..., description="Unique node ID (e.g., 'q0')")
     operation: OperationType = Field(..., description="Operation type")
     datasets: list[str] = Field(default_factory=list, description="FinMind datasets for finmind_query")
-    computed_field: Optional[str] = Field(default=None, description="Computed field name for compute operations")
-    formula: Optional[str] = Field(default=None, description="Formula referencing prerequisite node IDs")
+    computed_field: str | None = Field(default=None, description="Computed field name for compute operations")
+    formula: str | None = Field(default=None, description="Formula referencing prerequisite node IDs")
     params: dict[str, Any] = Field(default_factory=dict, description="Operation parameters")
     depends_on: list[str] = Field(default_factory=list, description="Direct prerequisite node IDs")
 
@@ -386,6 +391,58 @@ class RangeQueryType(str, Enum):
     MARKET = "market"
 
 
+class SupplyChainRelation(str, Enum):
+    """Supply chain relationship direction."""
+
+    UPSTREAM = "upstream"
+    DOWNSTREAM = "downstream"
+
+
+class QueryTopicKind(str, Enum):
+    """Unified summary: query topic type."""
+
+    SINGLE_STOCK = "single_stock"
+    RANGE = "range"
+
+
+class StockRelation(str, Enum):
+    """Related stock's relationship to the query topic."""
+
+    TARGET = "target"
+    UPSTREAM = "upstream"
+    DOWNSTREAM = "downstream"
+    RANGE_MEMBER = "range_member"
+
+
+class InferredIdentity(BaseModel):
+    """LLM-inferred identity for an anonymised counterparty (non-authoritative)."""
+
+    code: str = Field(..., description="Inferred company code")
+    name: str = Field(..., description="Inferred company name")
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Inference confidence")
+    rationale: str = Field(..., description="Reasoning for the inference")
+
+
+class SupplyChainEvidence(BaseModel):
+    """Evidence supporting a supply-chain link."""
+
+    counterparty_code: str = Field(..., description="Counterparty stock code")
+    counterparty_name: str = Field(..., description="Counterparty company name")
+    relation: SupplyChainRelation = Field(..., description="upstream or downstream")
+    target_ratio: float | None = Field(
+        default=None, ge=0.0, le=100.0, description="Revenue/purchase percentage"
+    )
+    disclosed_by: str = Field(
+        ..., description="Which side disclosed: target|counterparty|both"
+    )
+    source_pdf: str | None = Field(default=None, description="Source PDF filename")
+    fiscal_year: int | None = Field(
+        default=None,
+        ge=0,
+        description="ROC fiscal year (e.g. 113 for 2024) the disclosure comes from",
+    )
+
+
 class RangeStockResult(BaseModel):
     """Step 4 output (range mode): all stocks matching a sector/index/market."""
 
@@ -394,7 +451,7 @@ class RangeStockResult(BaseModel):
     stocks: list[StockItem] = Field(default_factory=list, description="Matching stocks")
     source: str = Field(..., description="Data source: combined|twse_api|tip|llm")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Result confidence")
-    matched_industry: Optional[str] = Field(default=None, description="Resolved industry name")
+    matched_industry: str | None = Field(default=None, description="Resolved industry name")
 
 
 class RelatedStockResult(BaseModel):
@@ -406,6 +463,116 @@ class RelatedStockResult(BaseModel):
     downstream: list[StockItem] = Field(default_factory=list, description="Direct downstream customers (1 layer)")
     source: str = Field(default="llm", description="Data source (supply chain is LLM-inferred)")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Result confidence")
+    evidence: list[SupplyChainEvidence] = Field(
+        default_factory=list, description="Source evidence for upstream/downstream links"
+    )
+
+
+class CounterpartyDisclosure(BaseModel):
+    """Single counterparty entry from annual report disclosure."""
+
+    raw_name: str = Field(..., description="Original name from annual report")
+    resolved_code: str | None = Field(
+        default=None, description="Listed stock code if resolvable"
+    )
+    resolved_name: str | None = Field(
+        default=None, description="Listed company name if resolvable"
+    )
+    ratio: float | None = Field(
+        default=None, ge=0.0, le=100.0, description="Revenue/purchase percentage"
+    )
+    is_related_party: bool = Field(
+        default=False, description="Whether this is a related-party entry"
+    )
+    note: str | None = Field(default=None, description="Extra notes from the source")
+    is_anonymous: bool = Field(
+        default=False, description="Name is anonymised (e.g. 公司A, 甲廠商)"
+    )
+    inferred: list[InferredIdentity] = Field(
+        default_factory=list,
+        description="LLM-inferred identities (non-authoritative, threshold >= 0.7)",
+    )
+
+
+class AnnualReportDisclosure(BaseModel):
+    """Full disclosure from a single annual report for one queried company."""
+
+    target_code: str = Field(..., description="Queried company stock code")
+    target_name: str = Field(..., description="Queried company name")
+    fiscal_year: int = Field(..., description="ROC fiscal year (e.g. 113 for 2024)")
+    report_type: str = Field(
+        ..., description="Report type from doc.twse: F04|F18|AI1|llm"
+    )
+    pdf_name: str | None = Field(
+        default=None, description="PDF filename if from doc.twse"
+    )
+    pdf_url: str | None = Field(
+        default=None, description="Full PDF URL if from doc.twse"
+    )
+    customers: list[CounterpartyDisclosure] = Field(
+        default_factory=list, description="Top customers"
+    )
+    suppliers: list[CounterpartyDisclosure] = Field(
+        default_factory=list, description="Top suppliers"
+    )
+    source_text: str | None = Field(
+        default=None, description="Extracted raw text snippet"
+    )
+    confidence: float = Field(
+        ..., ge=0.0, le=1.0, description="Extraction confidence"
+    )
+
+
+class ImpactStock(BaseModel):
+    """Single related stock in the unified summary."""
+
+    code: str = Field(..., description="Stock code")
+    name: str = Field(..., description="Company name")
+    relation: StockRelation = Field(
+        ..., description="Relationship to the query topic"
+    )
+    impact_score: float = Field(
+        ..., ge=0.0, le=1.0, description="Impact degree (0-1, higher = more impacted)"
+    )
+    ratio: float | None = Field(
+        default=None, ge=0.0, le=100.0, description="Annual-report ratio (%)"
+    )
+    fiscal_year: int | None = Field(
+        default=None, description="ROC fiscal year of this data point"
+    )
+    detail_source: str = Field(
+        ..., description="Data source: annual_report|llm|twse_api|tip"
+    )
+
+
+class QuerySummary(BaseModel):
+    """Unified summary: query topic + related stocks sorted by impact (high to low).
+
+    Attached to PipelineResult.summary (parallel to steps), built from
+    boundary + Step 4 results.
+    """
+
+    topic_kind: QueryTopicKind = Field(..., description="Query topic type")
+    topic_code: str | None = Field(
+        default=None, description="Single-stock mode: target stock code"
+    )
+    topic_name: str | None = Field(default=None, description="Target display name")
+    range_type: RangeQueryType | None = Field(
+        default=None, description="Range mode: sector/index/market"
+    )
+    range_value: str | None = Field(default=None, description="Range mode: range value")
+    fiscal_years: list[int] = Field(
+        default_factory=list,
+        description="Actual fiscal years used (ROC), newest first",
+    )
+    notes: list[str] = Field(
+        default_factory=list,
+        description="Data coverage notes (fallback, sub-year mapping, etc.)",
+    )
+    related_stocks: list[ImpactStock] = Field(
+        default_factory=list,
+        description="Related stocks sorted by impact_score descending",
+    )
 
 
 class PipelineStepResult(BaseModel):
@@ -421,6 +588,10 @@ class PipelineResult(BaseModel):
 
     question: str = Field(..., description="Original user question")
     steps: list[PipelineStepResult] = Field(..., description="Pipeline step trace")
+    summary: QuerySummary | None = Field(
+        default=None,
+        description="Unified summary: query topic + related stocks by impact (built from boundary + Step 4)",
+    )
 
 
 class ChartRequest(BaseModel):
@@ -429,9 +600,9 @@ class ChartRequest(BaseModel):
     stock_codes: list[str] = Field(..., description="Stock codes to chart")
     chart_data_requirements: ChartDataRequirement = Field(..., description="Chart data requirement type")
     chart_type: ChartType = Field(..., description="Chart type")
-    start_date: Optional[date] = Field(default=None, description="Start date (optional, uses defaults)")
-    end_date: Optional[date] = Field(default=None, description="End date (optional, uses defaults)")
-    date_range: Optional[DateRange] = Field(
+    start_date: date | None = Field(default=None, description="Start date (optional, uses defaults)")
+    end_date: date | None = Field(default=None, description="End date (optional, uses defaults)")
+    date_range: DateRange | None = Field(
         default=None, description="Optional date range; resolved into start/end dates when not set"
     )
 
