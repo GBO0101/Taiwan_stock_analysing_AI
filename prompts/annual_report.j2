@@ -1,0 +1,68 @@
+You are a precise Taiwan stock-market analyst. Extract the major customer and
+supplier disclosure tables from the annual-report text below.
+
+## Target company
+Stock code: {{ stock_code }}
+Company name: {{ stock_name }}
+Fiscal year (ROC): {{ fiscal_year }}
+
+## Instructions
+
+The text contains TWO kinds of supplier data:
+
+### A. Customer/supplier disclosure tables
+They are titled 「最近二年度...百分之十以上之供應商/客戶資訊」, 「前十大
+客戶」, 「前十大供應商」, or similar. The tables were flattened from
+fragmented PDF lines. Each row looks like:
+
+    1 台塑石化 53,578,492 33.44 註3
+
+meaning 序號, 名稱, 金額, 比率(%), 關係. Use the 比率 column for `ratio`.
+
+Extract every supplier row from the supplier table and every customer row from
+the customer table. Skip aggregate rows (其他, 合計, 小計, 總計, 進貨淨額,
+銷貨淨額).
+
+### B. Raw-material supplier table 「主要原料之供應狀況」
+It lists, per raw material, the major suppliers in a column titled
+「主要供應廠商」. Each line is a flat row like:
+
+    塑膠粉 公噸 234,548 台塑公司、台塑寧波
+    安定劑 公噸 6,966 內部撥轉、佳友化工
+
+meaning 原料種類, 單位, 數量, 主要供應廠商. Extract EVERY named company in
+the 主要供應廠商 cell as one supplier entry each (split on 、 and ，).
+
+- These rows have no ratio column: set `ratio` to null and `note` to the raw
+  material name (e.g. "塑膠粉").
+- SKIP cells that are not real companies: 內部撥轉, 自製, 進口, 不適用.
+
+### For every extracted row set:
+- `raw_name`: the exact printed name ("A 公司" style placeholders are kept
+  as-is).
+- `ratio`: the number as float (33.44 → 33.44) for group A tables ONLY; null
+  for group B.
+- `is_anonymous`: true if the name is a placeholder like "A 公司"/"客戶甲".
+- `is_related_party`: true if the 關係 column says 註3 採權益法 /
+  關係人 / 關聯企業 / 母公司 / 子公司.
+- `note`: the 關係 text or the raw material name, or null.
+5. If no customer table exists, return an empty customers list; do the same
+   for suppliers. Only leave both lists empty if no table at all exists.
+6. Preserve original Chinese names exactly.
+
+## Output (JSON only)
+
+{
+  "customers": [
+    {"raw_name": "...", "ratio": 12.5, "is_related_party": false, "is_anonymous": false, "note": null}
+  ],
+  "suppliers": [
+    {"raw_name": "...", "ratio": 8.3, "is_related_party": false, "is_anonymous": false, "note": null}
+  ],
+  "confidence": 0.9,
+  "fiscal_year": {{ fiscal_year }},
+  "notes": "short explanation"
+}
+
+## Annual report text (flattened)
+{{ report_text }}
