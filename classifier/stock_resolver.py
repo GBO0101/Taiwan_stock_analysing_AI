@@ -18,6 +18,19 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Curated name aliases: annual-report / colloquial names that differ from the
+# official TWSE short name (e.g. the official short name for 6505 is 台塑化,
+# but annual reports write 台塑石化). Keys are common names; values are the
+# official ``stock_name`` as stored in taiwan_stocks.json.
+_NAME_ALIASES: dict[str, str] = {
+    # 台塑集團年報（南亞 1303 / 台塑化 6505 / 台化…）用全名，與上市簡稱不同。
+    "台塑石化": "台塑化",
+    "台灣化學纖維": "台化",  # 台化 1326 的全名；年報供應商章節如此揭露
+    "台化纖": "台化",  # 市場常用簡稱（台灣化學纖維）
+    "金益鼎企業": "金益鼎",  # 金益鼎 8390（上櫃）的全名
+    "南亞塑膠工業": "南亞",  # 南亞 1303 全名；1326 年報銷貨表揭露「南亞塑膠工業(股)公司」
+}
+
 
 class StockResolutionError(Exception):
     """Raised when the stock mapping file cannot be loaded."""
@@ -63,15 +76,30 @@ class StockResolver:
             norm = self._normalize(name)
             self._by_name_norm.setdefault(norm, []).append(entry)
 
+        # Register curated aliases (e.g. 台塑石化 -> 台塑化/6505) so annual-
+        # report names resolve to the same entry as the official short name.
+        for alias, official in _NAME_ALIASES.items():
+            official_norm = self._normalize(official)
+            entries = self._by_name_norm.get(official_norm)
+            if not entries:
+                continue
+            alias_norm = self._normalize(alias)
+            if alias_norm not in self._by_name_norm:
+                self._by_name_norm[alias_norm] = list(entries)
+
     @staticmethod
     def _normalize(text: str) -> str:
         """Normalize a company name for matching.
 
-        Applies NFKC (full-width -> half-width), strips whitespace, and drops
-        trailing corporate suffixes so "台積電股份有限公司" matches "台積電".
+        Applies NFKC (full-width -> half-width), strips whitespace, drops the
+        ``(股)`` abbreviation (annual reports write 台塑石化(股)公司 for
+        台塑石化股份有限公司; NFKC already folds full-width （股） to (股)),
+        and drops trailing corporate suffixes so "台積電股份有限公司" matches
+        "台積電".
         """
         text = unicodedata.normalize("NFKC", text)
         text = "".join(text.split())
+        text = text.replace("(股)", "")
         for suffix in ("股份有限公司", "股份", "公司", "有限公司"):
             if text.endswith(suffix) and len(text) > len(suffix):
                 text = text[: -len(suffix)]

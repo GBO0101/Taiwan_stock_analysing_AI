@@ -18,6 +18,56 @@ class TestStockResolver:
     def test_resolve_name_unknown_returns_none(self):
         assert stock_resolver.resolve_name("不存在的公司xyz") is None
 
+    def test_resolve_name_unknown_unlisted_returns_none(self):
+        # 台化 1326 年報原料表的未上市/海外供應商：長春、日本出光、奇美等
+        # 不在台股地圖 → 必須回 None（不能讓未上市公司進入輸出）。
+        assert stock_resolver.resolve_name("長春") is None
+        assert stock_resolver.resolve_name("日本出光") is None
+        assert stock_resolver.resolve_name("日本UBE") is None
+        assert stock_resolver.resolve_name("SIBUR(LRD)") is None
+        assert stock_resolver.resolve_name("ASAHI") is None
+
+    def test_resolve_name_real_supplier_listed(self):
+        # 對照用戶人工名單：台化 1326 年報原料表的上市/上櫃供應商都要命中。
+        assert stock_resolver.resolve_name("台塑石化") == "6505"
+        assert stock_resolver.resolve_name("台塑") == "1301"
+        assert stock_resolver.resolve_name("南亞") == "1303"
+        assert stock_resolver.resolve_name("台橡") == "2103"
+        assert stock_resolver.resolve_name("中石化") == "1314"
+
+    def test_resolve_name_alias(self):
+        # Annual-report name 台塑石化 aliases to the official short name
+        # 台塑化 (TWSE id 6505).
+        assert stock_resolver.resolve_name("台塑石化") == "6505"
+        assert stock_resolver.resolve_name("台塑石化股份有限公司") == "6505"
+
+    def test_resolve_name_alias_full_names(self):
+        # Full company names used by annual-report supply-chain chapters that
+        # differ from the TWSE/TPEx short names (南亞 1303 年報案例).
+        assert stock_resolver.resolve_name("台灣化學纖維") == "1326"
+        assert stock_resolver.resolve_name("金益鼎企業") == "8390"
+        assert stock_resolver.resolve_name("台化纖") == "1326"
+
+    def test_resolve_name_alias_nanya_full_name(self):
+        # 台化 1326 年報銷貨表揭露「南亞塑膠工業(股)公司」→ 南亞/1303。
+        assert stock_resolver.resolve_name("南亞塑膠工業") == "1303"
+        assert stock_resolver.resolve_name("南亞塑膠工業(股)公司") == "1303"
+
+    def test_resolve_name_company_suffix_stripping(self):
+        # 「台塑公司」年報寫法 → strip 公司 → 台塑/1301（台化 丙烯腈供應商）。
+        assert stock_resolver.resolve_name("台塑公司") == "1301"
+        assert stock_resolver.resolve_name("南亞公司") == "1303"
+
+    def test_resolve_name_gu_fen_abbreviation(self):
+        # Annual reports write 股份有限公司 as (股), e.g. 台塑石化(股)公司.
+        # Normalization must fold it so the alias 台塑石化 -> 台塑化/6505
+        # still matches (台化 1326 年報案例).
+        assert stock_resolver.resolve_name("台塑石化(股) 公司") == "6505"
+        assert stock_resolver.resolve_name("台塑石化(股)公司") == "6505"
+        # Full-width （股） folds to half-width (股) via NFKC first.
+        assert stock_resolver.resolve_name("台塑石化（股）公司") == "6505"
+        assert stock_resolver.resolve_name("台灣化學纖維(股) 公司") == "1326"
+
     def test_verify_code_exists(self):
         info = stock_resolver.verify_code("2330")
         assert info["exists"] is True
@@ -44,7 +94,7 @@ class TestStockResolver:
         assert warnings == []
 
     def test_resolve_multi_stock_comparison(self):
-        codes, warnings = stock_resolver.resolve(["台積電", "鴻海"], [])
+        codes, _ = stock_resolver.resolve(["台積電", "鴻海"], [])
         assert codes == ["2330", "2317"]
 
     def test_resolve_drops_conflicting_llm_code(self):
