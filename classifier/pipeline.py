@@ -1,29 +1,27 @@
 """Pipeline runner: orchestrates Steps 1-4 in strict sequential order."""
 
 from typing import Any
-from classifier.models import (
-    BoundaryResult,
-    ClassificationResult,
-    DecompositionResult,
-    PipelineResult,
-    PipelineStepResult,
-    StepStatus,
-    ClassificationType,
-    StockScope,
-)
-from classifier.boundary import extract_boundary, BoundaryExtractionError
-from classifier.classification import classify_query, ClassificationError
-from classifier.decomposition import decompose_query, DecompositionError
-from classifier.stock_enumeration import StockEnumeration, StockEnumerationError
+
+from classifier.boundary import BoundaryExtractionError, extract_boundary
+from classifier.classification import ClassificationError, classify_query
+from classifier.decomposition import DecompositionError, decompose_query
+from classifier.indicator_mapper import IndicatorMapper
 from classifier.isin_client import IsinClient
 from classifier.llm_client import LLMClient
-from classifier.indicator_mapper import IndicatorMapper
+from classifier.models import (
+    ClassificationType,
+    PipelineResult,
+    PipelineStepResult,
+    QuerySummary,
+    StepStatus,
+    StockScope,
+)
+from classifier.stock_enumeration import StockEnumeration, StockEnumerationError
 
 
 class PipelineError(Exception):
     """Pipeline execution errors."""
 
-    pass
 
 
 class Pipeline:
@@ -142,6 +140,7 @@ class Pipeline:
             ))
 
         # Step 4: Stock Enumeration (conditional)
+        summary: QuerySummary | None = None
         should_enumerate = (
             classification.type != ClassificationType.NON_FINANCIAL
             and (
@@ -154,6 +153,7 @@ class Pipeline:
         if should_enumerate:
             try:
                 enum_result = self.enumeration.run(question=question, boundary=boundary)
+                summary = self.enumeration.build_summary(boundary, enum_result)
                 steps.append(PipelineStepResult(
                     step="stock_enumeration",
                     status=StepStatus.COMPLETED,
@@ -176,4 +176,5 @@ class Pipeline:
         return PipelineResult(
             question=question,
             steps=steps,
+            summary=summary,
         )

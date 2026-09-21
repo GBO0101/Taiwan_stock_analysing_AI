@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from classifier.annual_report import AnnualReportError
 from classifier.boundary import BoundaryExtractionError
 from classifier.classification import ClassificationError
 from classifier.decomposition import DecompositionError
@@ -23,9 +24,11 @@ from classifier.stock_enumeration import _SupplyChainModel
 class TestPipeline:
     """Test pipeline runner functionality."""
 
+    @patch("classifier.stock_enumeration.extract_annual_report",
+           side_effect=AnnualReportError("no network in tests"))
     @patch("classifier.pipeline.LLMClient")
     @patch("classifier.pipeline.IndicatorMapper")
-    def test_pipeline_analytical_query(self, mock_mapper_class, mock_llm_class):
+    def test_pipeline_analytical_query(self, mock_mapper_class, mock_llm_class, mock_annual_report):
         """Test full pipeline with analytical query."""
         mock_llm = Mock()
         mock_llm_class.return_value = mock_llm
@@ -74,10 +77,15 @@ class TestPipeline:
         assert result.steps[2].status == StepStatus.COMPLETED
         assert result.steps[3].step == "stock_enumeration"
         assert result.steps[3].status == StepStatus.COMPLETED
+        # Completed Step 4 → unified summary present.
+        assert result.summary is not None
+        assert result.summary.topic_code == "2330"
 
+    @patch("classifier.stock_enumeration.extract_annual_report",
+           side_effect=AnnualReportError("no network in tests"))
     @patch("classifier.pipeline.LLMClient")
     @patch("classifier.pipeline.IndicatorMapper")
-    def test_pipeline_live_query_skips_decomposition(self, mock_mapper_class, mock_llm_class):
+    def test_pipeline_live_query_skips_decomposition(self, mock_mapper_class, mock_llm_class, mock_annual_report):
         """Test pipeline skips decomposition for live queries."""
         mock_llm = Mock()
         mock_llm_class.return_value = mock_llm
@@ -108,9 +116,11 @@ class TestPipeline:
         assert result.steps[2].status == StepStatus.SKIPPED
         assert result.steps[3].step == "stock_enumeration"
 
+    @patch("classifier.stock_enumeration.extract_annual_report",
+           side_effect=AnnualReportError("no network in tests"))
     @patch("classifier.pipeline.LLMClient")
     @patch("classifier.pipeline.IndicatorMapper")
-    def test_pipeline_factual_query_skips_decomposition(self, mock_mapper_class, mock_llm_class):
+    def test_pipeline_factual_query_skips_decomposition(self, mock_mapper_class, mock_llm_class, mock_annual_report):
         """Test pipeline skips decomposition for factual queries."""
         mock_llm = Mock()
         mock_llm_class.return_value = mock_llm
@@ -232,9 +242,11 @@ class TestPipeline:
         with pytest.raises(PipelineError, match="Step 3"):
             pipeline.run("台積電未來展望")
 
+    @patch("classifier.stock_enumeration.extract_annual_report",
+           side_effect=AnnualReportError("no network in tests"))
     @patch("classifier.pipeline.LLMClient")
     @patch("classifier.pipeline.IndicatorMapper")
-    def test_pipeline_with_context(self, mock_mapper_class, mock_llm_class):
+    def test_pipeline_with_context(self, mock_mapper_class, mock_llm_class, mock_annual_report):
         """Test pipeline with chat context."""
         mock_llm = Mock()
         mock_llm_class.return_value = mock_llm
