@@ -11,6 +11,9 @@ __pycache__/
 # Generated chart output
 output/
 
+# Runtime TTL cache (doc.twse / annual-report extraction snapshots)
+classifier/cache/
+
 # Tooling / local state
 .omo/
 .codegraph/
