@@ -15,6 +15,7 @@ import pytest
 
 from classifier.annual_report import (
     _MAX_PDF_PAGES,
+    _MAX_SEGMENT_CHARS,
     _MAX_SEGMENT_RETRIES,
     _SECTION_HEADER_RE,
     _AnnualReportExtract,
@@ -662,3 +663,83 @@ class TestResolveEntriesEnumerationSplit:
         entries = [_entry("台橡、台橡", note="橡膠")]
         disclosures, _ = _resolve_entries(entries, stock_resolver, "supplier")
         assert [d.raw_name for d in disclosures if d.resolved_code] == ["台橡"]
+
+
+class TestSegmentCharsBudget:
+    """每段 LLM 呼叫的字符上限：南亞 112 卡點的回歸測試。
+
+    根因：``_MAX_EXTRACT_CHARS=50000`` 的註解用英文 tokenizer 估算「roughly
+    15k tokens」，但年報是 CJK——約 1 字符 ≈ 1 token，50k 字符實際 40-50k
+    tokens ≫ ``num_ctx=16384``。單一 LLM 呼叫餵進超大輸入會觸發兩種死亡路徑：
+    120s read timeout（log 實測）或垃圾 JSON 輸出（實測 20k+ 字符 15s 內
+    LLMOutputError），再乘上 retries×passes×segments 就是 20-40 分鐘卡死。
+
+    修復：每個 segment 送入 LLM 前的字符必須被 ``_MAX_SEGMENT_CHARS`` 截斷
+    （實測 qwen2.5:7b / num_ctx=16384 的安全區 ≤10k 字符），且分組時以整塊保留
+    表格（不切半）。
+    """
+
+    def test_max_segment_chars_stays_within_measured_safe_zone(self):
+        # 實測：≤10k 字符 5-10s 穩定成功；20k 字符起 15s 內吐垃圾或超時。
+        # 這個值一旦被調大就會讓本地 LLM 呼叫重新掉進 timeout/garbage 輪迴。
+        assert _MAX_SEGMENT_CHARS <= 10000
+
+    def test_locate_output_feeds_splitter_not_the_llm(self):
+        # ``_locate`` 的輸出是 segment 化的輸入，可大於單次 LLM 呼叫上限
+        # （splitter 會再做整塊保留式截斷）。此測試鎖定：多個 table window
+        # 遠超預算時，定位輸出仍包含所有 table 視窗，分組截斷發生在 split 之後。
+        single_window = "台塑石化 33.44 註3 "
+        long_table = "前十大客戶之名稱及銷貨金額、比例：" + single_window * 3000
+        focused = _locate_customer_supplier_sections(long_table)
+        # 單一 window 的配置上限（200 before + 4000 after）必須可見。
+        assert "台塑石化" in focused
+
+    def test_extract_segment_truncates_oversized_segment(self):
+        # _extract_segment 收到超大 segment 時必須先截斷再送 LLM，
+        # 且截斷後仍成功回傳有效結果（不被垃圾輸出拖垮）。
+        segment = "供應商/客戶資訊 台塑石化 53,578,492 33.44 註3\n" * 5000  # ~24 萬字符
+        assert len(segment) > _MAX_SEGMENT_CHARS
+        llm = self._make_llm(_extract(suppliers=[_entry("台塑石化", 33.44)]))
+        result = _extract_segment(
+            segment,
+            stock_code="1303",
+            stock_name="南亞",
+            fiscal_year=112,
+            llm_client=llm,
+        )
+        assert result.suppliers[0].raw_name == "台塑石化"
+        assert llm.extract_structured.call_count == 1
+        # 確認實際送出的 prompt（固定模板 ~3k + report_text）已被截斷到
+        # segment 上限以內：不會把 24 萬字符原文整個送進 LLM。
+        sent_prompt = llm.extract_structured.call_args[0][0]
+        assert len(sent_prompt) <= _MAX_SEGMENT_CHARS + 5000
+
+    def test_split_segments_each_within_budget(self):
+        # 分組後的每個 segment（disclosure / raw_material）都必須落在單次
+        # 呼叫的安全字符上限內——即使單一表格區塊本身就超上限。
+        block_a = "前十大客戶之名稱及銷貨金額、比例：" + ("台塑石化 33.44 註3\n" * 3000)
+        block_b = "主要原料之供應狀況 塑膠粉 公噸 234,548 台塑公司、台塑寧波\n" * 3000
+        focused = f"{block_a}\n\n---\n\n{block_b}"
+        segments = _split_report_segments(focused)
+        for seg in segments:
+            assert len(seg) <= _MAX_SEGMENT_CHARS
+
+    def test_split_drops_no_whole_block_when_group_overflows(self):
+        # 整塊保留式截斷：多個小區塊一起超過上限時，前面的完整區塊必須被
+        # 保留，只截斷最後裝不下的那塊——不會從中間切掉一整張表。
+        rows = "台塑石化 33.44 註3\n"
+        header = "前十大客戶之名稱及銷貨金額、比例："
+        block = header + rows
+        # 每個 window ~70 字符；500 個 = 35k，遠超單一 segment 上限。
+        many = [block] * 500
+        focused = "\n\n---\n\n".join(many)
+        segments = _split_report_segments(focused)
+        first = segments[0]
+        assert len(first) <= _MAX_SEGMENT_CHARS
+        # 至少一個完整 block（含表頭）被保留，而非從表頭後被切掉。
+        assert header in first
+
+    def _make_llm(self, result):
+        llm = Mock()
+        llm.extract_structured.return_value = result
+        return llm

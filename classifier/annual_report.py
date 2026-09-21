@@ -133,8 +133,21 @@ _TABLE_HEADER_RE = re.compile(
     r"主要原料之供應狀況|與關係人進銷貨)"
 )
 
-# Roughly 15k tokens — safe for local LLMs on Windows.
+# Collecting budget for ``_locate_customer_supplier_sections``: how many
+# characters of merged table windows are kept before segmentation. This is
+# NOT the per-LLM-call limit — each output segment is further capped at
+# ``_MAX_SEGMENT_CHARS`` so every single call to the local model stays inside
+# its own context window.
 _MAX_EXTRACT_CHARS = 50000
+
+# Per-LLM-call input cap (characters of report text). Annual-report extracts
+# are CJK: qwen2.5 tokenizes roughly 1 char ≈ 1 token, so a full
+# ``_MAX_EXTRACT_CHARS`` segment would be 40-50k tokens ≫ ``num_ctx=16384``.
+# Measured on local qwen2.5:7b: ≤10k chars complete in 5-10s, while 20k+
+# chars either hit the 120s read timeout or emit garbage JSON within 15s
+# (南亞 112 卡點：122.1s timeout × retries × passes = 20-40 min hang). Every
+# segment is truncated to this cap before its LLM call.
+_MAX_SEGMENT_CHARS = 10000
 
 # Per-segment LLM extraction retries. Local LLMs intermittently fail JSON-mode
 # validation (e.g. ``is_related_party: null``) or emit an empty extraction;
@@ -272,6 +285,33 @@ def _flatten_table_lines(text: str, join_len: int = 28) -> str:
     return "\n".join(out)
 
 
+def _join_capped_blocks(blocks: list[str], max_chars: int = _MAX_SEGMENT_CHARS) -> str:
+    """Join ``blocks`` into one prompt segment, capped at ``max_chars``.
+
+    Whole ``---``-separated blocks are appended while they fit — cutting inside
+    a block would slice a table window in half and silently lose rows. Only the
+    last block that would overflow the cap is truncated to fill the remaining
+    room. This keeps every LLM call inside the model's context window (南亞 112
+    卡點：50k 字符段落在本地 qwen2.5:7b / num_ctx=16384 下觸發 120s timeout
+    或垃圾 JSON 輸出).
+    """
+    parts_out: list[str] = []
+    used = 0
+    for block in blocks:
+        sep = 7 if parts_out else 0  # "\n\n---\n\n"
+        if used + sep + len(block) <= max_chars:
+            parts_out.append(block)
+            used += sep + len(block)
+        elif used < max_chars:
+            room = max_chars - used - sep
+            if room > 0:
+                parts_out.append(block[:room])
+            break
+        else:
+            break
+    return "\n\n---\n\n".join(parts_out)
+
+
 def _split_report_segments(focused: str) -> list[str]:
     """Partition the located section text into independent prompt segments.
 
@@ -281,7 +321,9 @@ def _split_report_segments(focused: str) -> list[str]:
     models truncate/lose the group-B rows (measured: identical input produced
     3/3/15 suppliers across runs — the raw-material rows were dropped). Each
     group is prompted separately and the results merged, so group B always
-    gets its own short, focused prompt.
+    gets its own short, focused prompt. Each group is additionally capped at
+    ``_MAX_SEGMENT_CHARS`` (whole blocks preserved) so no single LLM call
+    exceeds the model's context window.
 
     Falls back to a single segment when the text cannot be classified.
     """
@@ -304,10 +346,10 @@ def _split_report_segments(focused: str) -> list[str]:
 
     parts: list[str] = []
     if disclosure:
-        parts.append("\n\n---\n\n".join(disclosure))
+        parts.append(_join_capped_blocks(disclosure))
     if raw_material:
-        parts.append("\n\n---\n\n".join(raw_material))
-    return parts or [focused]
+        parts.append(_join_capped_blocks(raw_material))
+    return parts or [_join_capped_blocks([focused])]
 
 
 def _merge_extracts(
@@ -362,8 +404,8 @@ def _extract_segment(
     completely empty extraction on a segment that clearly contains table rows
     (local LLMs intermittently drop everything instead of just some rows).
     """
-    if len(segment) > _MAX_EXTRACT_CHARS:
-        segment = segment[:_MAX_EXTRACT_CHARS]
+    if len(segment) > _MAX_SEGMENT_CHARS:
+        segment = segment[:_MAX_SEGMENT_CHARS]
     segment = _flatten_table_lines(segment)
     prompt = prompt_manager.render(
         "annual_report.j2",
