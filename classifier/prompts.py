@@ -2,15 +2,13 @@
 
 from pathlib import Path
 from typing import Any
-from jinja2 import Environment, FileSystemLoader, TemplateNotFound
 
-from classifier.config import settings
+from jinja2 import Environment, FileSystemLoader, TemplateNotFound
 
 
 class PromptTemplateError(Exception):
     """Prompt template errors."""
 
-    pass
 
 
 class PromptManager:
@@ -106,9 +104,35 @@ class PromptManager:
             stocks=stocks,
         )
 
-    def render_supply_chain(self, stock_code: str, stock_name: str) -> str:
+    def render_supply_chain(
+        self,
+        stock_code: str,
+        stock_name: str,
+        industry_hint: str | None = None,
+    ) -> str:
         """Render the supply-chain (upstream/downstream) inference prompt."""
-        return self.render("supply_chain.j2", stock_code=stock_code, stock_name=stock_name)
+        return self.render(
+            "supply_chain.j2",
+            stock_code=stock_code,
+            stock_name=stock_name,
+            industry_hint=industry_hint,
+        )
+
+    def render_annual_report(
+        self,
+        stock_code: str,
+        stock_name: str,
+        fiscal_year: int,
+        report_text: str,
+    ) -> str:
+        """Render the annual-report customer/supplier extraction prompt."""
+        return self.render(
+            "annual_report.j2",
+            stock_code=stock_code,
+            stock_name=stock_name,
+            fiscal_year=fiscal_year,
+            report_text=report_text,
+        )
 
 
 # Global instance
