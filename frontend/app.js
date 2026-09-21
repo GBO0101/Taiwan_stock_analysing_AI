@@ -7,6 +7,8 @@ const els = {
   submit: document.getElementById("submit-btn"),
   showJson: document.getElementById("show-json"),
   error: document.getElementById("error-banner"),
+  loading: document.getElementById("loading"),
+  loadingStatus: document.getElementById("loading-status"),
   results: document.getElementById("results"),
   steps: document.getElementById("steps"),
   chartContainer: document.getElementById("chart-container"),
@@ -15,6 +17,34 @@ const els = {
 };
 
 let lastResult = null;
+const PROGRESS_POLL_MS = 800;
+
+function showLoading(message) {
+  els.loadingStatus.textContent = message;
+  els.loading.classList.remove("hidden");
+}
+
+function hideLoading() {
+  els.loading.classList.add("hidden");
+}
+
+function newClientId() {
+  if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+  return `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+}
+
+async function pollProgress(clientId, onUpdate) {
+  try {
+    const resp = await fetch(`${API_BASE}/pipeline/progress/${encodeURIComponent(clientId)}`);
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.status === "running") {
+      onUpdate(data.message || "處理中…");
+    }
+  } catch (e) {
+    // Poll failures are non-fatal; the POST response is the source of truth.
+  }
+}
 
 function showError(message) {
   els.error.textContent = message;
@@ -150,12 +180,20 @@ async function submitQuestion() {
   els.results.classList.add("hidden");
   els.chartContainer.classList.add("hidden");
   els.submit.disabled = true;
+  showLoading("處理中…");
+
+  const clientId = newClientId();
+  const pollTimer = setInterval(() => {
+    pollProgress(clientId, (message) => {
+      els.loadingStatus.textContent = message;
+    });
+  }, PROGRESS_POLL_MS);
 
   try {
     const resp = await fetch(`${API_BASE}/pipeline`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ question }),
+      body: JSON.stringify({ question, client_id: clientId }),
     });
 
     if (!resp.ok) {
@@ -176,6 +214,8 @@ async function submitQuestion() {
   } catch (e) {
     showError(`請求失敗: ${e.message}`);
   } finally {
+    clearInterval(pollTimer);
+    hideLoading();
     els.submit.disabled = false;
   }
 }

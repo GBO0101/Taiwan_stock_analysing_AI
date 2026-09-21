@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -177,12 +178,16 @@ class StockEnumeration:
         self,
         question: str,
         boundary: BoundaryResult,
+        progress: Callable[[str, str], None] | None = None,
     ) -> RangeStockResult | RelatedStockResult:
         """Dispatch to range or related based on the boundary.
 
         Args:
             question: Original user question (unused beyond context/debug).
             boundary: Step 1 boundary extraction output.
+            progress: Optional ``(step_key, message)`` callback forwarded to
+                range/related modes (annual-report extraction, cross-validation,
+                LLM validation).
 
         Returns:
             A RangeStockResult or RelatedStockResult.
@@ -192,17 +197,19 @@ class StockEnumeration:
         """
         # Single-stock query → related (supply chain).
         if len(boundary.stock_codes) == 1:
-            return self.related_stock(boundary.stock_codes[0], boundary)
+            return self.related_stock(boundary.stock_codes[0], boundary, progress)
 
         # Sector/range topic → range enumeration. Use the most specific sector
         # if the LLM/boundary named any; otherwise fall back to company names.
         if boundary.sectors:
-            return self.range_stocks(boundary.sectors[0], RangeQueryType.SECTOR)
+            return self.range_stocks(boundary.sectors[0], RangeQueryType.SECTOR, progress=progress)
 
         # A range query without an explicit sector word: try the first company
         # name as the range value (best effort) or raise.
         if boundary.company_names:
-            return self.range_stocks(boundary.company_names[0], RangeQueryType.SECTOR)
+            return self.range_stocks(
+                boundary.company_names[0], RangeQueryType.SECTOR, progress=progress
+            )
 
         raise StockEnumerationError(
             "Cannot enumerate: no sector/topic and no single stock code found"
@@ -216,6 +223,7 @@ class StockEnumeration:
         query_value: str,
         query_type: RangeQueryType = RangeQueryType.SECTOR,
         market: str = "TWSE",
+        progress: Callable[[str, str], None] | None = None,
     ) -> RangeStockResult:
         """Enumerate stocks by sector, falling back to LLM if ISIN fails.
 
@@ -226,6 +234,8 @@ class StockEnumeration:
         api_stocks: list[StockItem] = []
         api_ok = False
         try:
+            if progress is not None:
+                progress("stock_enumeration", f"查詢「{query_value}」關聯個股…")
             api_stocks = self.isin.by_sector(query_value, market=market)
             api_ok = True
         except IsinClientError as e:
@@ -234,6 +244,8 @@ class StockEnumeration:
         # LLM validation/supplement.
         validation: _RangeValidationModel | None = None
         try:
+            if progress is not None:
+                progress("stock_enumeration", "LLM 驗證名單…")
             prompt = prompt_manager.render_stock_validation(
                 query_value=query_value,
                 query_type=query_type.value,
@@ -300,6 +312,7 @@ class StockEnumeration:
         self,
         stock_code: str,
         boundary: BoundaryResult | None = None,
+        progress: Callable[[str, str], None] | None = None,
     ) -> RelatedStockResult:
         """Resolve upstream/downstream of a single stock, annual-report-first.
 
@@ -331,6 +344,8 @@ class StockEnumeration:
         #    (ascending, so the newest usable year lands last and wins as primary).
         disclosures: list[AnnualReportDisclosure] = []
         for fy in fiscal_years:
+            if progress is not None:
+                progress("stock_enumeration", f"提取 {stock_name}({stock_code}) 民國 {fy} 年報…")
             try:
                 disclosure = extract_annual_report(
                     stock_code,
@@ -420,7 +435,9 @@ class StockEnumeration:
             # Counterparty annual reports also cover a single year; checking
             # every year × counterparty would explode doc.twse + LLM calls.
             primary_evidence = [ev for ev in evidence if ev.fiscal_year == used_fy]
-            self._cross_validate(primary_evidence, used_fy, stock_code)
+            if progress is not None:
+                progress("stock_enumeration", "交叉驗證供應鏈關係…")
+            self._cross_validate(primary_evidence, used_fy, stock_code, progress)
         else:
             # 2) LLM fallback.
             try:
@@ -486,6 +503,7 @@ class StockEnumeration:
                 {s.code for s in upstream} | {s.code for s in downstream},
                 stock_code,
                 fiscal_years[-1],
+                progress,
             )
             if verified:
                 notes.append(
@@ -516,6 +534,7 @@ class StockEnumeration:
         evidence: list[SupplyChainEvidence],
         fiscal_year: int,
         target_code: str,
+        progress: Callable[[str, str], None] | None = None,
     ) -> None:
         """Phase 1.5: check counterparties' annual reports for a two-sided link.
 
@@ -532,6 +551,11 @@ class StockEnumeration:
 
         checked = 0
         for ev in candidates[:_MAX_CROSS_VALIDATE]:
+            if progress is not None:
+                progress(
+                    "stock_enumeration",
+                    f"交叉驗證 {ev.counterparty_name}({ev.counterparty_code}) 民國 {fiscal_year} 年報…",
+                )
             try:
                 cdisc = extract_annual_report(
                     ev.counterparty_code,
@@ -581,6 +605,7 @@ class StockEnumeration:
         valid_codes: set[str],
         target_code: str,
         fiscal_year: int,
+        progress: Callable[[str, str], None] | None = None,
     ) -> int:
         """Phase 2.0: verify LLM-inferred links via nominees' annual reports.
 
@@ -618,6 +643,11 @@ class StockEnumeration:
         promoted = 0
         for ev in candidates[:_MAX_CROSS_VALIDATE]:
             t0 = time.monotonic()
+            if progress is not None:
+                progress(
+                    "stock_enumeration",
+                    f"驗證 {ev.counterparty_name}({ev.counterparty_code}) 年報確認供應鏈關係…",
+                )
             logger.info(
                 "Fetching nominee %s(%s) annual report (fiscal %d) to verify %s link",
                 ev.counterparty_code,

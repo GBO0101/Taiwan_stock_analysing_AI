@@ -2,6 +2,7 @@
 
 import logging
 import time
+from collections.abc import Callable
 from typing import Any
 
 from classifier.boundary import BoundaryExtractionError, extract_boundary
@@ -58,12 +59,16 @@ class Pipeline:
         self,
         question: str,
         context: dict[str, Any] | None = None,
+        progress: Callable[[str, str], None] | None = None,
     ) -> PipelineResult:
         """Execute the full pipeline on a question.
 
         Args:
             question: User's natural language question
             context: Optional chat context for pronoun resolution
+            progress: Optional ``(step_key, message)`` callback fired just
+                before the start of each step (and with ``("done", …)`` when
+                the pipeline finishes).
 
         Returns:
             PipelineResult with step trace
@@ -76,6 +81,8 @@ class Pipeline:
 
         # Step 1: Boundary Extraction
         t0 = time.monotonic()
+        if progress is not None:
+            progress("boundary", "Step 1/4：解析問題範圍")
         try:
             boundary = extract_boundary(
                 question=question,
@@ -112,6 +119,8 @@ class Pipeline:
 
         # Step 2: Classification
         t0 = time.monotonic()
+        if progress is not None:
+            progress("classification", "Step 2/4：判斷查詢類型")
         try:
             classification = classify_query(
                 question=question,
@@ -148,6 +157,8 @@ class Pipeline:
         # Step 3: Decomposition (conditional - only for analytical queries)
         t0 = time.monotonic()
         if classification.type == ClassificationType.ANALYTICAL:
+            if progress is not None:
+                progress("decomposition", "Step 3/4：拆解分析任務")
             try:
                 decomposition = decompose_query(
                     question=question,
@@ -199,9 +210,15 @@ class Pipeline:
         )
 
         t0 = time.monotonic()
+        if progress is not None:
+            progress("stock_enumeration", "Step 4/4：分析供應鏈關係")
         if should_enumerate:
             try:
-                enum_result = self.enumeration.run(question=question, boundary=boundary)
+                enum_result = self.enumeration.run(
+                    question=question,
+                    boundary=boundary,
+                    progress=progress,
+                )
                 summary = self.enumeration.build_summary(boundary, enum_result)
                 steps.append(
                     PipelineStepResult(
@@ -237,6 +254,9 @@ class Pipeline:
                     output={"reason": "Skipped: no scope/stock codes or non-financial query"},
                 )
             )
+
+        if progress is not None:
+            progress("done", "完成")
 
         logger.info(
             "Pipeline finished in %.2fs: %s",

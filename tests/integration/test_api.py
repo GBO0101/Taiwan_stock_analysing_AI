@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -116,6 +117,104 @@ def test_pipeline_endpoint_pipeline_error(client):
         resp = client.post("/pipeline", json={"question": "台積電"})
     assert resp.status_code == 500
     assert "error" in resp.json()
+
+
+@pytest.fixture(autouse=True)
+def _clear_progress_registry():
+    """Reset the module-level progress registry between tests."""
+    yield
+    with api_module._progress_lock:
+        api_module._progress.clear()
+
+
+def test_pipeline_progress_done_after_post(client):
+    fake = _fake_llm()
+    real = Pipeline(llm_client=fake)
+    with patch("classifier.api.Pipeline", return_value=real):
+        resp = client.post(
+            "/pipeline",
+            json={"question": "台積電未來展望", "client_id": "cid-done"},
+        )
+        assert resp.status_code == 200
+
+    prog = client.get("/pipeline/progress/cid-done")
+    assert prog.status_code == 200
+    data = prog.json()
+    assert data["status"] == "done"
+    assert data["step"] == "done"
+    assert "elapsed_sec" in data
+
+
+def test_pipeline_progress_running_mid_flight(client):
+    fake = _fake_llm()
+    real = Pipeline(llm_client=fake)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_run(question, progress=None):
+        assert progress is not None
+        progress("boundary", "Step 1/4：解析問題範圍")
+        entered.set()
+        release.wait(timeout=5)
+        return real.run(question, progress=progress)
+
+    pipeline_mock = MagicMock()
+    pipeline_mock.run.side_effect = slow_run
+    with patch("classifier.api.Pipeline", return_value=pipeline_mock):
+        thread = threading.Thread(
+            target=lambda: client.post(
+                "/pipeline",
+                json={"question": "台積電", "client_id": "cid-running"},
+            )
+        )
+        thread.start()
+        try:
+            assert entered.wait(timeout=5), "pipeline run never started"
+
+            prog = client.get("/pipeline/progress/cid-running")
+            assert prog.status_code == 200
+            data = prog.json()
+            assert data["status"] == "running"
+            assert data["step"] == "boundary"
+            assert "elapsed_sec" in data
+        finally:
+            release.set()
+            thread.join(timeout=5)
+
+
+def test_pipeline_progress_unknown_client(client):
+    resp = client.get("/pipeline/progress/never-registered")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "unknown"}
+
+
+def test_pipeline_progress_failed_on_error(client):
+    fake = _fake_llm()
+    fake.extract_structured.side_effect = LLMError("boom")
+    real = Pipeline(llm_client=fake)
+    with patch("classifier.api.Pipeline", return_value=real):
+        resp = client.post(
+            "/pipeline",
+            json={"question": "台積電", "client_id": "cid-fail"},
+        )
+    assert resp.status_code == 500
+
+    prog = client.get("/pipeline/progress/cid-fail")
+    assert prog.status_code == 200
+    data = prog.json()
+    assert data["status"] == "failed"
+    assert "message" in data
+
+
+def test_pipeline_without_client_id_no_progress_tracked(client):
+    fake = _fake_llm()
+    real = Pipeline(llm_client=fake)
+    with patch("classifier.api.Pipeline", return_value=real):
+        resp = client.post("/pipeline", json={"question": "台積電未來展望"})
+    assert resp.status_code == 200
+
+    # No client_id in the request → nothing should be registered.
+    assert api_module._progress == {}
 
 
 def test_chart_endpoint_returns_png(client):
