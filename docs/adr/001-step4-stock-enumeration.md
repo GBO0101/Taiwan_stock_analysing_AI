@@ -26,13 +26,26 @@ If condition is not met, Step 4 is skipped (status = `skipped`).
 | Mode | When | Input | Output |
 |------|------|-------|--------|
 | **Range** | Boundary has range/topic but `stock_codes` is empty or contains only placeholder codes | sector name, index name, or date range | list of `{code, name}` for all matching stocks |
-| **Related** | Boundary has exactly 1 stock code (single-stock query) | stock code | upstream suppliers `[{code, name}]` + downstream customers `[{code, name}]` |
+| **Related** | Boundary has exactly 1 stock code (single-stock query) | stock code | upstream suppliers `[{code, name}]` + downstream customers `[{code, name}]`, each with `evidence` (disclosed_by, target_ratio, source_pdf) |
 
 If boundary has multiple stock codes (e.g., from a prior range query or explicit multi-stock input), Step 4 runs in **Range** mode for each code group.
 
+#### Related mode: Annual-report-first + LLM fallback
+
+```
+1. 提取目標股票的股東會年報（doc.twse.com.tw，F18 含合併財報優先，F04 次要）。
+2. PyMuPDF 指定頁面抽取文字 → LLM 結構化抽取前五大客戶/供應商。
+3. 用 StockResolver 交叉驗證每個 counterparty 是否為上市櫃公司。
+   - counterparty 可解析 → 併入 upstream/downstream；以 ratio 作為 impact。
+   - counterparty 不可解析 → 跳過。
+4. Phase 1.5：對 up to 3 家 ratio 最高的 counterparty，抓取其自身年報，
+   - 若他們也列出目標股票 → disclosed_by = "both"（雙邊揭露）。
+5. 若年報未公告或無可解析 counterparty → fallback 到 LLM 推論（supply_chain.j2）。
+```
+
 ### Pydantic Models
 
-Two independent models in `models.py`:
+Models in `models.py` (Step 4 only; `models.py` is the single source of truth):
 
 ```python
 class StockItem(BaseModel):
@@ -40,11 +53,10 @@ class StockItem(BaseModel):
     name: str          # e.g., "台積電"
 
 class RangeStockResult(BaseModel):
-    query_type: str            # "sector" | "index" | "market" | "date_range"
-    query_value: str           # e.g., "半導體", "台灣50", "2024年1月"
+    query_type: str            # "sector" | "index" | "market"
+    query_value: str           # e.g., "半導體", "台灣50"
     stocks: list[StockItem]    # all matching stocks
-    time_range: DateRange | None = None  # if date-range based
-    source: str                # "twse_api" | "llm" | "combined"
+    source: str                # "combined" | "twse_api" | "llm"
     confidence: float          # 0.0–1.0
 
 class RelatedStockResult(BaseModel):
@@ -52,8 +64,36 @@ class RelatedStockResult(BaseModel):
     stock_name: str            # target name
     upstream: list[StockItem]  # direct suppliers (1 layer)
     downstream: list[StockItem]  # direct customers (1 layer)
-    source: str                # "llm" | "api" | "combined"
+    source: str                # "annual_report" | "llm"
     confidence: float          # 0.0–1.0
+    evidence: list[SupplyChainEvidence]  # disclosed_by, target_ratio, source_pdf
+
+class SupplyChainEvidence(BaseModel):
+    counterparty_code: str
+    counterparty_name: str
+    relation: SupplyChainRelation      # UPSTREAM | DOWNSTREAM
+    target_ratio: float | None         # Revenue/purchase percentage (annual report only)
+    disclosed_by: str                  # "target" | "both" | "llm_inferred"
+    source_pdf: str | None             # PDF filename from doc.twse.com.tw
+
+class ImpactStock(BaseModel):
+    code: str
+    name: str
+    relation: StockRelation            # TARGET | UPSTREAM | DOWNSTREAM | RANGE_MEMBER
+    impact_score: float                # 0–1; higher = more impacted
+    ratio: float | None                # annual-report ratio (%), for related mode
+    fiscal_year: int | None            # ROC fiscal year of this data point
+    detail_source: str                 # "annual_report" | "llm" | "twse_api"
+
+class QuerySummary(BaseModel):
+    topic_kind: QueryTopicKind        # SINGLE_STOCK | RANGE
+    topic_code: str | None            # target stock code (related mode)
+    topic_name: str | None            # display name
+    range_type: RangeQueryType | None # sector/index/market (range mode)
+    range_value: str | None           # "半導體", "台灣50" (range mode)
+    fiscal_years: list[int]           # ROC fiscal years, newest first
+    notes: list[str]                  # coverage notes
+    related_stocks: list[ImpactStock] # sorted by impact_score descending
 ```
 
 ### Pipeline Integration
@@ -61,11 +101,13 @@ class RelatedStockResult(BaseModel):
 - Output stored in `PipelineResult.steps[]` as a new step (name: `"stock_enumeration"`)
 - `Pipeline.run()` adds Step 4 after Step 3, guarded by the trigger condition
 - Step 4 execution is **synchronous** (same as Steps 1–3)
+- `Pipeline.run()` builds `PipelineResult.summary` (a `QuerySummary`) from the Step 4 result, so downstream agents receive a unified topic + related-stocks structure alongside the step trace
 
 ### Caching
 
-- TWSE API data (sector→stocks, index→constituents) cached locally with 7-day TTL
-- Cache stored in `classifier/stock_cache.py` or `cache/` directory
+- ISIN sector→stock list: 7-day TTL (`classifier/stock_cache.py`)
+- TIP index constituents: 7-day TTL
+- Annual report disclosure (`AnnualReportDisclosure`): 30-day TTL in `classifier/stock_cache.py`; key = `annual_report_{code}_{fiscal_year}` (raw extracted JSON is cached; per-request PDF fetch still hits doc.twse.com.tw)
 - LLM results are **never** cached (query-dependent)
 
 ### Frontend
