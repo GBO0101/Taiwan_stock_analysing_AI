@@ -1,20 +1,19 @@
 """Unit tests for LLMClient."""
 
-import json
 from unittest.mock import Mock, patch
 
 import pytest
+import requests
 from pydantic import BaseModel, Field
 
 from classifier.llm_client import (
+    LLMAuthError,
     LLMClient,
     LLMError,
     LLMNetworkError,
-    LLMTimeoutError,
-    LLMAuthError,
     LLMOutputError,
+    LLMTimeoutError,
 )
-from classifier.models import BoundaryResult, ClassificationType
 
 
 class TestResponseModel(BaseModel):
@@ -173,6 +172,115 @@ class TestLLMClient:
         client = LLMClient()
         with pytest.raises(LLMOutputError, match="LLM error"):
             client.extract_structured("test prompt", TestResponseModel)
+
+    def test_extract_structured_native_chat_num_ctx(self, monkeypatch):
+        """num_ctx routes to Ollama's native /api/chat with options.num_ctx.
+
+        Ollama's OpenAI-compatible /v1/chat/completions silently drops the
+        ``options`` map, so num_ctx would never take effect there. The native
+        endpoint honours it.
+        """
+        import classifier.config as config_mod
+
+        monkeypatch.setattr(config_mod.settings, "llm_api_key", "ollama")
+        monkeypatch.setattr(config_mod.settings, "llm_model", "qwen2.5:7b")
+        monkeypatch.setattr(config_mod.settings, "llm_timeout", 30)
+        monkeypatch.setattr(
+            config_mod.settings, "llm_base_url", "http://localhost:11434/v1"
+        )
+
+        mock_resp = Mock()
+        # Native responses may wrap JSON in markdown fences + trailing prose
+        mock_resp.json.return_value = {
+            "message": {
+                "content": '```json\n{"value": "test", "confidence": 0.9}\n```'
+            }
+        }
+
+        with patch(
+            "classifier.llm_client.requests.post", return_value=mock_resp
+        ) as mock_post:
+            client = LLMClient()
+            result = client.extract_structured(
+                "test prompt", TestResponseModel, num_ctx=16384
+            )
+
+        assert isinstance(result, TestResponseModel)
+        assert result.value == "test"
+        assert result.confidence == 0.9
+
+        post_kwargs = mock_post.call_args.kwargs
+        # base_url with /v1 suffix → native /api/chat path
+        assert mock_post.call_args.args[0] == "http://localhost:11434/api/chat"
+        assert post_kwargs["json"]["options"] == {"num_ctx": 16384}
+        assert post_kwargs["json"]["stream"] is False
+        assert post_kwargs["json"]["model"] == "qwen2.5:7b"
+        assert post_kwargs["timeout"] == 30
+
+    def test_extract_structured_native_chat_timeout(self, monkeypatch):
+        """Native /api/chat timeout maps to LLMTimeoutError."""
+        import classifier.config as config_mod
+
+        monkeypatch.setattr(config_mod.settings, "llm_api_key", "ollama")
+        monkeypatch.setattr(config_mod.settings, "llm_model", "qwen2.5:7b")
+        monkeypatch.setattr(config_mod.settings, "llm_timeout", 30)
+        monkeypatch.setattr(
+            config_mod.settings, "llm_base_url", "http://localhost:11434/v1"
+        )
+
+        with patch(
+            "classifier.llm_client.requests.post",
+            side_effect=requests.Timeout("timed out"),
+        ):
+            client = LLMClient()
+            with pytest.raises(LLMTimeoutError, match="Request timeout"):
+                client.extract_structured(
+                    "test prompt", TestResponseModel, num_ctx=16384
+                )
+
+    def test_extract_structured_native_chat_network_error(self, monkeypatch):
+        """Native /api/chat connection error maps to LLMNetworkError."""
+        import classifier.config as config_mod
+
+        monkeypatch.setattr(config_mod.settings, "llm_api_key", "ollama")
+        monkeypatch.setattr(config_mod.settings, "llm_model", "qwen2.5:7b")
+        monkeypatch.setattr(config_mod.settings, "llm_timeout", 30)
+        monkeypatch.setattr(
+            config_mod.settings, "llm_base_url", "http://localhost:11434/v1"
+        )
+
+        with patch(
+            "classifier.llm_client.requests.post",
+            side_effect=requests.ConnectionError("connection refused"),
+        ):
+            client = LLMClient()
+            with pytest.raises(LLMNetworkError, match="Network error"):
+                client.extract_structured(
+                    "test prompt", TestResponseModel, num_ctx=16384
+                )
+
+    def test_extract_structured_native_chat_empty(self, monkeypatch):
+        """Native /api/chat empty content maps to LLMOutputError."""
+        import classifier.config as config_mod
+
+        monkeypatch.setattr(config_mod.settings, "llm_api_key", "ollama")
+        monkeypatch.setattr(config_mod.settings, "llm_model", "qwen2.5:7b")
+        monkeypatch.setattr(config_mod.settings, "llm_timeout", 30)
+        monkeypatch.setattr(
+            config_mod.settings, "llm_base_url", "http://localhost:11434/v1"
+        )
+
+        mock_resp = Mock()
+        mock_resp.json.return_value = {"message": {"content": ""}}
+
+        with patch(
+            "classifier.llm_client.requests.post", return_value=mock_resp
+        ):
+            client = LLMClient()
+            with pytest.raises(LLMOutputError, match="empty content"):
+                client.extract_structured(
+                    "test prompt", TestResponseModel, num_ctx=16384
+                )
 
     def test_exception_hierarchy(self):
         """Test exception class hierarchy."""
