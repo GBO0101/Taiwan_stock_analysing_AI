@@ -22,9 +22,11 @@ from classifier.annual_report import (
     _extract_segment,
     _extract_text_from_pdf,
     _flatten_table_lines,
+    _ground_extract,
     _LLMCounterpartyEntry,
     _locate_customer_supplier_sections,
     _merge_extracts,
+    _ratios_verifiable,
     _resolve_entries,
     _scan_raw_material_names,
     _split_report_segments,
@@ -116,6 +118,29 @@ class TestLocateCustomerSupplierSections:
         assert "南通寶峰" in focused
         assert "金益鼎企業" in focused
 
+    def test_table_title_window_ranked_before_sticky_prose(self):
+        # 台積電 112 根因：真實供應商表標題「進貨淨額10%以上之供應商資料」
+        # 不含任何舊 sticky 詞，被排到含「前十大客戶」的銷售集中散文視窗
+        # 之後並超額截斷 → LLM 幻覺整份名單。修正後真表視窗（優先度 0）
+        # 必須排在純散文視窗（優先度 1）之前。
+        prose = "本公司銷售集中於前十大客戶，占比高且集中，惟尚無重大風險。\n"
+        filler = "（此為無關之財報附註文字，用於把兩個揭露視窗隔開超過 4000 字符。）\n"
+        table = (
+            "進貨淨額10%以上之供應商資料\n"
+            "甲公司 15,547,041 12.79 供應商\n"
+            "乙公司 12,300,000 10.36 供應商\n"
+        )
+        # prose 視窗 = [0, len(prose)+4000]；filler 把真表推到視窗界外，
+        # 使兩者成為不重疊的兩個獨立視窗。
+        text = prose + filler * 200 + table
+        focused = _locate_customer_supplier_sections(text)
+
+        # 真表視窗排最前（優先度 0 < 1），且真表內容完整。
+        assert focused.index("進貨淨額10%以上之供應商資料") < focused.index("前十大客戶")
+        assert "乙公司 12,300,000 10.36" in focused
+        # 兩個獨立視窗 → 恰一個分隔符。
+        assert focused.count("---") == 1
+
     @pytest.mark.parametrize(
         "title",
         [
@@ -125,6 +150,12 @@ class TestLocateCustomerSupplierSections:
             "關聯企業及主要交易往來",
             "主要原料之供應狀況",
             "主要原料之使用狀況及供應廠商",
+            # 台積電 112 真實表標題 —— 根因字串，必須永遠命中。
+            "進貨淨額10%以上之供應商資料",
+            "銷貨淨額10%以上之客戶資料",
+            # 只寫「供應商/客戶資料」當標題的年報也必須被定位。
+            "供應商資料",
+            "客戶資料",
         ],
     )
     def test_regulatory_titles_match_regex(self, title: str):
@@ -297,6 +328,26 @@ class TestSplitReportSegments:
         focused = "公司簡介與財報附註，沒有可辨識的表格標題。"
         assert _split_report_segments(focused) == [focused]
 
+    def test_table_title_block_kept_whole_over_sticky_prose(self):
+        # 台積電 112 根因的 split 層防護：disclosure group 內同時有「只提到
+        # 前十大客戶的散文 block」（優先度 1）與真表標題 block「進貨淨額
+        # 10%以上之供應商資料」（優先度 0）且合計超上限時，真表 block 必須
+        # 整塊保留並排在散文之前；散文（優先度較低）被截斷。
+        prose = "本公司銷售集中於前十大客戶，占比高且集中，惟尚無重大風險。\n" * 400
+        table = "進貨淨額10%以上之供應商資料\n甲公司 15,547,041 12.79\n乙公司 12,300,000 10.36\n"
+        focused = f"{prose}\n\n---\n\n{table}"
+        segments = _split_report_segments(focused)
+
+        assert len(segments) == 1  # 兩 block 同屬 disclosure group
+        seg = segments[0]
+        assert len(seg) <= _MAX_SEGMENT_CHARS
+        # 真表整塊保留且排在前面。
+        assert "進貨淨額10%以上之供應商資料" in seg
+        assert "乙公司 12,300,000 10.36" in seg
+        assert seg.index("進貨淨額10%以上") < seg.index("前十大客戶")
+        # 散文被截斷（合計超上限），完整 prose 不可能全部留下。
+        assert len(seg) < len(prose) + len(table)
+
 
 class TestMergeExtracts:
     def test_unions_and_dedups_by_name_note(self):
@@ -408,6 +459,114 @@ class TestExtractSegmentRetry:
         assert llm.extract_structured.call_count == 1
 
 
+class TestGroundTruthValidation:
+    """台積電 112 幻覺根因之二：LLM 輸出必須能對回報告文本。
+
+    LLM 在真表被截斷時會複製 prompt 範例（台塑石化 33.44、佳友化工）＋世界
+    知識，輸出整份假名單。``_ground_extract`` 把每個 ``raw_name`` 拆格後逐字
+    對回 segment：任何部分不在文本 → 丟整列；``ratio`` 對不回數字 → 清空為
+    None。
+    """
+
+    _TABLE = (
+        "進貨淨額10%以上之供應商資料\n"
+        "甲公司 15,547,041 12.79 供應商\n"
+        "乙公司 12,300,000 10.36 供應商\n"
+    )
+    _TABLE_ROW_SEGMENT = (
+        "進貨淨額10%以上之供應商資料\n甲公司 15,547,041 12.79%、乙公司 12,300,000 10.36%\n"
+    )
+
+    def test_drops_hallucinated_name_not_in_text(self):
+        # 台塑石化 是 prompt 範例名、不在真實文本 → 整列丟棄。
+        ex = _extract(suppliers=[_entry("台塑石化", 33.44)])
+        emptied = _ground_extract(ex, self._TABLE)
+        assert ex.suppliers == []
+        assert emptied is True
+
+    def test_keeps_grounded_name(self):
+        ex = _extract(suppliers=[_entry("甲公司", 12.79)])
+        emptied = _ground_extract(ex, self._TABLE)
+        assert [e.raw_name for e in ex.suppliers] == ["甲公司"]
+        assert emptied is False
+
+    def test_nulls_ratio_not_in_text(self):
+        # 名字在文本、比例不在（99.99 是 LLM 幻覺值）→ 名字保留、比例清空。
+        ex = _extract(suppliers=[_entry("甲公司", 99.99)])
+        _ground_extract(ex, self._TABLE)
+        assert ex.suppliers[0].raw_name == "甲公司"
+        assert ex.suppliers[0].ratio is None
+
+    def test_keeps_ratio_present_in_text(self):
+        ex = _extract(suppliers=[_entry("甲公司", 12.79)])
+        _ground_extract(ex, self._TABLE)
+        assert ex.suppliers[0].ratio == 12.79
+
+    def test_enumeration_cell_stripped_to_grounded_parts(self):
+        # 「台塑石化、甲公司」拆格：台塑石化 不在文本 → raw_name 縮為可證部分。
+        ex = _extract(suppliers=[_entry("台塑石化、甲公司", 12.79)])
+        _ground_extract(ex, self._TABLE)
+        assert [e.raw_name for e in ex.suppliers] == ["甲公司"]
+        assert ex.suppliers[0].ratio == 12.79
+
+    def test_partial_grounding_keeps_only_verified_rows(self):
+        # 一半真一半假 → 只留真的（不回傳幻覺列，也不誤觸重試）。
+        ex = _extract(suppliers=[_entry("台塑石化", 33.44), _entry("甲公司", 12.79)])
+        emptied = _ground_extract(ex, self._TABLE)
+        assert [e.raw_name for e in ex.suppliers] == ["甲公司"]
+        assert emptied is False
+
+    @pytest.mark.parametrize(
+        ("ratio", "segment", "expected"),
+        [
+            (12.79, "占全年度進貨淨額比率(%) 12.79", True),
+            (20.0, "2024年度銷貨淨額 X 千元", False),  # 20 不得誤配進 2024
+            (12.5, "12.5%", True),
+            (12.79, "12.79%", True),
+        ],
+    )
+    def test_ratios_verifiable_boundaries(self, ratio, segment, expected):
+        assert _ratios_verifiable(ratio, segment) is expected
+
+    def test_ratio_with_trailing_zero_rep(self):
+        # 文本印「12.50」、LLM 回 12.5 → 也要認。
+        assert _ratios_verifiable(12.5, "12.50")
+
+    def test_extract_segment_retries_when_all_rows_hallucinated(self):
+        # 台積電 112 核心修復：第一輪 LLM 整段幻覺（真表被截斷時複製範例
+        # 名）→ emptied=True → 重試，第二輪回真實行。
+        llm = Mock()
+        llm.extract_structured.side_effect = [
+            _extract(suppliers=[_entry("台塑石化", 33.44), _entry("佳友化工", 7.32)]),
+            _extract(suppliers=[_entry("甲公司", 12.79)]),
+        ]
+        result = _extract_segment(
+            self._TABLE_ROW_SEGMENT,
+            stock_code="2330",
+            stock_name="台積電",
+            fiscal_year=112,
+            llm_client=llm,
+        )
+        assert [s.raw_name for s in result.suppliers] == ["甲公司"]
+        assert llm.extract_structured.call_count == 2
+
+    def test_extract_segment_no_retry_when_partially_grounded(self):
+        # 一半真一半假 → 只留真的，不因部分幻覺額外重試。
+        llm = Mock()
+        llm.extract_structured.side_effect = [
+            _extract(suppliers=[_entry("台塑石化", 33.44), _entry("甲公司", 12.79)]),
+        ]
+        result = _extract_segment(
+            self._TABLE_ROW_SEGMENT,
+            stock_code="2330",
+            stock_name="台積電",
+            fiscal_year=112,
+            llm_client=llm,
+        )
+        assert [s.raw_name for s in result.suppliers] == ["甲公司"]
+        assert llm.extract_structured.call_count == 1
+
+
 class TestExtractMultiPassUnion:
     """_extract：同一 segment 多次並集抽取收斂。
 
@@ -422,6 +581,7 @@ class TestExtractMultiPassUnion:
         "可塑劑 公噸 28,826 內部撥轉、南通寶峰\n"
         "環氧氯丙烷 公噸 161,379 无棣鑫岳化工集团有限公、台塑公司\n"
         "玻纖紗 公噸 86,442 台灣必成\n"
+        "醋酸 公噸 12,000 台化\n"
         "銅線 公噸 74,322 金益鼎企業、鏶鑫企業\n"
     )
 

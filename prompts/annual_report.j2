@@ -12,10 +12,11 @@ The text contains TWO kinds of supplier data:
 
 ### A. Customer/supplier disclosure tables
 They are titled 「最近二年度...百分之十以上之供應商/客戶資訊」, 「前十大
-客戶」, 「前十大供應商」, or similar. The tables were flattened from
-fragmented PDF lines. Each row looks like:
+客戶」, 「前十大供應商」, 「進貨淨額10%以上之供應商資料」, 「主要客戶資訊」
+or similar. The tables were flattened from fragmented PDF lines. Each row looks
+like:
 
-    1 台塑石化 53,578,492 33.44 註3
+    1 甲公司 53,578,492 33.44 註3
 
 meaning 序號, 名稱, 金額, 比率(%), 關係. Use the 比率 column for `ratio`.
 
@@ -27,8 +28,8 @@ the customer table. Skip aggregate rows (其他, 合計, 小計, 總計, 進貨�
 It lists, per raw material, the major suppliers in a column titled
 「主要供應廠商」. Each line is a flat row like:
 
-    塑膠粉 公噸 234,548 台塑公司、台塑寧波
-    安定劑 公噸 6,966 內部撥轉、佳友化工
+    塑膠粉 公噸 234,548 供應商甲、供應商乙
+    安定劑 公噸 6,966 內部撥轉、供應商丙
 
 meaning 原料種類, 單位, 數量, 主要供應廠商. Extract EVERY named company in
 the 主要供應廠商 cell as one supplier entry each (split on 、 and ，).
@@ -36,6 +37,14 @@ the 主要供應廠商 cell as one supplier entry each (split on 、 and ，).
 - These rows have no ratio column: set `ratio` to null and `note` to the raw
   material name (e.g. "塑膠粉").
 - SKIP cells that are not real companies: 內部撥轉, 自製, 進口, 不適用.
+
+### GROUNDING RULE (REQUIRED, applies to ALL rows)
+Only output names that **literally appear in the report text below**. The
+company names above (甲公司, 供應商甲…) are fabricated examples — never copy
+them into the output. If a real report discloses anonymously (甲公司, 乙公司,
+甲客戶, A 公司), output that placeholder exactly as printed and set
+`is_anonymous: true`. Never substitute a real company name from your own
+knowledge: a name that is not in the text is a fabrication.
 
 ### For every extracted row set:
 - `raw_name`: the exact printed name ("A 公司" style placeholders are kept

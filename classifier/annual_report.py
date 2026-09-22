@@ -116,8 +116,8 @@ _SECTION_HEADER_RE = re.compile(
     r"前十(大|名)客戶|前五大客戶|主要客戶|"
     r"前十(大|名)供應商|前五大供應商|主要供應商|主要供應廠商|"
     r"關聯企業及主要交易往來|與關係人進銷貨|"
-    r"佔?全年度(進|銷)貨淨額|進貨淨額|銷貨淨額|"
-    r"主要原料之供應狀況|原料之使用狀況)",
+    r"佔?全年度合併?(進|銷)貨淨額|(進|銷)貨淨額\s*(10%以上|百分之十以上)|"
+    r"主要原料之供應狀況|原料之使用狀況|供應商資料|客戶資料)",
     re.IGNORECASE,
 )
 
@@ -127,11 +127,45 @@ _SECTION_WINDOW_AFTER = 4000
 
 # Sticky headers = the actual disclosure tables. Windows carrying them get
 # evicted last when the merged output would overflow the token budget.
+# 台積電 112 根因：真實供應商表標題「進貨淨額10%以上之供應商資料」不含任何舊
+# sticky 詞，被排到所有財報散文視窗之後並被截斷 → LLM 幻覺整份名單。以下
+# 加進「進貨淨額10%以上」「供應商資料」等真表詞，讓真表具有最高保留優先權。
 _TABLE_HEADER_RE = re.compile(
     r"(供應商/客戶資訊|客戶/供應商資訊|前十(大|名)客戶|前五大客戶|前十大客戶|"
     r"前十(大|名)供應商|前五大供應商|主要客戶|主要供應商|主要供應廠商|"
-    r"主要原料之供應狀況|與關係人進銷貨)"
+    r"主要原料之供應狀況|與關係人進銷貨|供應商資料|客戶資料|"
+    r"(進|銷)貨淨額\s*(10%以上|百分之十以上))"
 )
+
+# The precise *title* of an actual disclosure table, as opposed to prose that
+# merely mentions the disclosure terms (台積電 112: the 銷售集中之風險 prose
+# contains 「前十大客戶」 but is not a table). Windows/blocks carrying one of
+# these table titles get the absolute highest retention priority, so the
+# genuine >10% supplier/customer tables can never be pushed past the segment
+# cap by sticky-term prose.
+_DISCLOSURE_TABLE_TITLE_RE = re.compile(
+    r"(進\(?銷\)?貨總額百分之十以上|"
+    r"(進|銷)貨淨額\s*(10%以上|百分之十以上)|"
+    r"前十(大|名)(客戶|供應商)之名稱及(進|銷)貨金額|"
+    r"(主要客戶(資訊|資料)|(供應商|客戶)(資訊|資料)))"
+)
+
+
+def _window_priority(text: str) -> int:
+    """Retention priority of a located window / prompt block.
+
+    0 = carries an actual disclosure TABLE title (highest priority — never
+        evict the true >10% supplier/customer tables),
+    1 = carries a broader sticky header term but no table title (prose that
+        merely mentions 前十大客戶, 主要原料之供應狀況…),
+    2 = everything else (generic 進貨/銷貨 mentions, financial statements).
+    """
+    if _DISCLOSURE_TABLE_TITLE_RE.search(text):
+        return 0
+    if _TABLE_HEADER_RE.search(text):
+        return 1
+    return 2
+
 
 # Collecting budget for ``_locate_customer_supplier_sections``: how many
 # characters of merged table windows are kept before segmentation. This is
@@ -172,7 +206,8 @@ _MAX_SEGMENT_PASSES = 3
 _DISCLOSURE_SEGMENT_RE = re.compile(
     r"(供應商/客戶資訊|客戶/供應商資訊|前十(大|名)客戶|前五大客戶|主要客戶|"
     r"前十(大|名)供應商|前五大供應商|主要供應商|關聯企業及主要交易往來|"
-    r"與關係人進銷貨|佔?全年度(進|銷)貨淨額|進貨淨額|銷貨淨額)"
+    r"與關係人進銷貨|佔?全年度合併?(進|銷)貨淨額|(進|銷)貨淨額\s*(10%以上|百分之十以上)|"
+    r"供應商資料|客戶資訊|客戶資料)"
 )
 _RAW_MATERIAL_SEGMENT_RE = re.compile(r"(主要原料之供應狀況|主要供應廠商|原料之使用狀況)")
 
@@ -229,13 +264,16 @@ def _locate_customer_supplier_sections(full_text: str) -> str:
         else:
             merged.append((start, end))
 
-    # Windows containing the sticky disclosure-table headers rank first, so
-    # overflow never evicts the actual tables in favour of generic 進貨/銷貨
-    # mentions from the financial statements.
+    # Windows carrying the actual disclosure-TABLE titles rank first, then
+    # windows that merely mention the sticky disclosure terms (e.g. the
+    # 銷售集中之風險 prose with 「前十大客戶」), so overflow never evicts the
+    # genuine tables in favour of generic 進貨/銷貨 mentions or prose
+    # (台積電 112: real supplier table was pushed past the budget and the LLM
+    # hallucinated the entire vendor list).
     ordered = sorted(
         merged,
         key=lambda span: (
-            0 if _TABLE_HEADER_RE.search(full_text[span[0] : span[1]]) else 1,
+            _window_priority(full_text[span[0] : span[1]]),
             span[0],
         ),
     )
@@ -294,10 +332,21 @@ def _join_capped_blocks(blocks: list[str], max_chars: int = _MAX_SEGMENT_CHARS) 
     room. This keeps every LLM call inside the model's context window (南亞 112
     卡點：50k 字符段落在本地 qwen2.5:7b / num_ctx=16384 下觸發 120s timeout
     或垃圾 JSON 輸出).
+
+    Blocks carrying the actual disclosure-TABLE titles are joined FIRST
+    (``_window_priority`` 0), then sticky-term prose, so a large pile of
+    surrounding prose (sales-concentration risk notes, financial-statement
+    附註) can never push the genuine >10% supplier/customer tables past the
+    cap (台積電 112 根因：真表被擠出 segment，LLM 只看到散文與 prompt 範例 →
+    幻覺整份供應商名單)。
     """
+    ordered = sorted(
+        enumerate(blocks),
+        key=lambda item: (_window_priority(item[1]), item[0]),
+    )
     parts_out: list[str] = []
     used = 0
-    for block in blocks:
+    for _, block in ordered:
         sep = 7 if parts_out else 0  # "\n\n---\n\n"
         if used + sep + len(block) <= max_chars:
             parts_out.append(block)
@@ -391,6 +440,73 @@ def _merge_extracts(
     )
 
 
+def _ratios_verifiable(ratio: float, segment: str) -> bool:
+    """True when a number equal to ``ratio`` is actually printed in ``segment``.
+
+    The disclosure table prints the ratio as-is ("33.44", "20"), possibly with
+    trailing zeros ("12.50"). Accept the ``g`` and ``:.2f`` representations and
+    require a non-digit boundary so "20" never matches inside "2024".
+    """
+    candidates = {f"{ratio:g}", f"{ratio:.2f}", f"{ratio:.2f}".rstrip("0").rstrip(".")}
+    return any(re.search(rf"(?<!\d){re.escape(c)}(?!\d)", segment) for c in candidates if c)
+
+
+def _ground_extract(extract: _AnnualReportExtract, segment: str) -> bool:
+    """Drop LLM entries whose names are not verifiable in ``segment``.
+
+    Local LLMs fabricate disclosure rows when the real table is missing from
+    the input — 台積電 112 年報實測：供應商表被截斷後，LLM 複製 prompt 範例
+    (台塑石化 33.44、佳友化工) 加上世界知識，輸出 7 家從未出現於文本的公司與
+    9 個比例。此處把每個 ``raw_name`` 都對回 segment 文本（逐字 substring，
+    拆格後逐部分比對），任何部分不在文本中即丟棄整列；``ratio`` 也要能對回
+    文本中的數字，否則清空為 None。
+
+    Returns True when the extract became completely empty after filtering.
+    """
+    became_empty = True
+    for field in ("customers", "suppliers"):
+        entries = getattr(extract, field)
+        if not entries:
+            continue
+        kept: list[_LLMCounterpartyEntry] = []
+        for entry in entries:
+            parts = [
+                p.strip() for p in _ENUMERATION_SPLIT_RE.split(entry.raw_name) if p.strip()
+            ] or [entry.raw_name]
+            grounded = [p for p in parts if p in segment]
+            if not grounded:
+                logger.warning(
+                    "Dropping annual-report %s row '%s': name not found in report text",
+                    field,
+                    entry.raw_name,
+                )
+                continue
+            if len(grounded) < len(parts):
+                # Merged cell (e.g. 「台塑石化、金益鼎企業」) where only part of
+                # the enumeration is real → keep only the grounded names so the
+                # hallucinated member never reaches resolution.
+                logger.warning(
+                    "Stripping %s row '%s' down to grounded names: %s",
+                    field,
+                    entry.raw_name,
+                    "、".join(grounded),
+                )
+                entry.raw_name = "、".join(grounded)
+            if entry.ratio is not None and not _ratios_verifiable(entry.ratio, segment):
+                logger.warning(
+                    "Nulling annual-report %s ratio %.4g for '%s': number not in text",
+                    field,
+                    entry.ratio,
+                    entry.raw_name,
+                )
+                entry.ratio = None
+            kept.append(entry)
+        setattr(extract, field, kept)
+        if kept:
+            became_empty = False
+    return became_empty
+
+
 def _extract_segment(
     segment: str,
     stock_code: str,
@@ -430,6 +546,19 @@ def _extract_segment(
                 )
                 continue
             raise
+        had_rows = bool(extract.customers or extract.suppliers)
+        emptied = _ground_extract(extract, segment) if had_rows else False
+        if had_rows and emptied and attempt < attempts:
+            # Every row the LLM returned was unverifiable in the report text
+            # (prompt-example copies / world knowledge) — retry rather than
+            # emit a fabricated list (台積電 112 hallucination).
+            logger.warning(
+                "Annual-report segment extraction attempt %d/%d returned only "
+                "names absent from the report text — retrying",
+                attempt,
+                attempts,
+            )
+            continue
         if (
             looks_like_table
             and not extract.customers
